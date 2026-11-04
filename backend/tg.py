@@ -125,7 +125,7 @@ class Policy:
         if raw in SERVICE_IDS:
             raise Fail("That is Telegram's service chat (login codes); it is never accessible through this server.")
         if raw in self.blocked_ids:
-            raise Fail("That is the approval bot's chat; it is not accessible through this server.")
+            raise Fail("That is this server's control bot; its chat is not accessible through this server.")
         if isinstance(ent, T.User) and ent.is_self and not self.allow_saved:
             raise Fail("Saved Messages are off limits on this server (TGC_ALLOW_SAVED_MESSAGES is off).")
         if raw in self.deny or peer_id(ent) in self.deny:

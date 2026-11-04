@@ -26,7 +26,7 @@ def test_saved_messages_blocked_by_default():
 def test_approval_bot_blocked():
     p = tg.Policy()
     p.blocked_ids.add(999)
-    with pytest.raises(tg.Fail, match="approval bot"):
+    with pytest.raises(tg.Fail, match="control bot"):
         p.check(user(999, bot=True))
 
 

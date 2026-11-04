@@ -33,15 +33,20 @@ logger = logging.getLogger(__name__)
 
 BOT_API = "https://api.telegram.org"
 LOCKED_MSG = ("🔒 The owner has locked telegram-client from Telegram. Every tool refuses until he "
-              "sends /unlock to the approval bot. Stop and tell the user; do not retry.")
-HELP = ("telegram-client approval bot\n\n"
-        "Drafts arrive here with ✅ Send / ❌ Cancel. Nothing is sent without your tap.\n\n"
-        "/status  — session, lock, pending drafts, budget, recent tool calls\n"
-        "/pending — drafts waiting for you\n"
-        "/lock    — every MCP tool refuses (reads too); pending drafts are cancelled\n"
-        "/unlock  — resume\n\n"
-        "To kill the session itself: Telegram → Settings → Devices → terminate it.")
+              "unlocks it. Stop and tell the user; do not retry.")
 RULE = "━━━━━━━━━━━━"
+
+
+def help_text(approval_mode: bool) -> str:
+    sends = ("Drafts arrive here with ✅ Send / ❌ Cancel. Nothing is sent without your tap.\n\n"
+             "/pending — drafts waiting for you\n" if approval_mode else
+             "Sends go out directly (TGC_SEND_APPROVAL=false); each one is logged here silently.\n\n")
+    return ("telegram-client control bot\n\n" + sends +
+            "/status  — session, lock, sending mode, budget, recent tool calls\n"
+            "/lock    — every MCP tool refuses, reads and sends" +
+            ("; pending drafts are cancelled\n" if approval_mode else "\n") +
+            "/unlock  — resume\n\n"
+            "To kill the session itself: Telegram → Settings → Devices → terminate it.")
 
 
 class BotError(Exception):
@@ -104,7 +109,9 @@ _OUTCOME = {
 
 class Approvals:
     def __init__(self, token: str, owner_id: int, *, state_file: Path, ttl_s: float = 1800,
-                 max_pending: int = 5, max_per_hour: int = 30, http: Any = None):
+                 max_pending: int = 5, max_per_hour: int = 30, http: Any = None,
+                 approval_mode: bool = True):
+        self.approval_mode = approval_mode
         self.token = token
         self.owner_id = owner_id
         self.ttl_s = ttl_s
@@ -154,14 +161,16 @@ class Approvals:
         except Exception:
             pass
 
-    async def notify(self, text: str, *, key: str | None = None, every_s: float = 0) -> bool:
-        """Message the owner; never raises. `key`/`every_s` rate-limit repeated alerts."""
+    async def notify(self, text: str, *, key: str | None = None, every_s: float = 0,
+                     silent: bool = False) -> bool:
+        """Message the owner; never raises. `key`/`every_s` rate-limit repeated alerts;
+        `silent` delivers without a sound (the per-send log in direct mode)."""
         now = time.time()
         if key and now - self._alerts.get(key, 0) < every_s:
             return False
         try:
             await self.api("sendMessage", chat_id=self.owner_id, text=text[:4000],
-                           link_preview_options={"is_disabled": True})
+                           link_preview_options={"is_disabled": True}, disable_notification=silent)
             if key:
                 self._alerts[key] = now
             return True
@@ -335,7 +344,7 @@ class Approvals:
         text = (m.get("text") or "").strip()
         cmd = text.split()[0].split("@")[0].lower() if text else ""
         if cmd in ("/start", "/help"):
-            await self._reply(HELP)
+            await self._reply(help_text(self.approval_mode))
         elif cmd == "/lock":
             self.set_locked(True)
             n = 0
@@ -348,6 +357,9 @@ class Approvals:
         elif cmd == "/unlock":
             self.set_locked(False)
             await self._reply("🔓 Unlocked. Tools work again; sends still need your tap.")
+        elif cmd == "/pending" and not self.approval_mode:
+            await self._reply("Approval is off (TGC_SEND_APPROVAL=false): sends go out directly, "
+                              "so nothing ever waits here.")
         elif cmd == "/pending":
             pend = [d for d in self.drafts.values() if d.status == "pending"]
             if not pend:

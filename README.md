@@ -1,6 +1,6 @@
-MCP server that acts as your own Telegram account; every send waits for your tap in an approval bot.
+MCP server that acts as your own Telegram account; sends wait for your tap in a control bot, or go out directly with `TGC_SEND_APPROVAL=false`.
 
-Fill `.env` from `.env.example`, press Start in the approval bot, then on the VPS:
+Fill `.env` from `.env.example`, press Start in the control bot, then on the VPS:
 ```
 docker network create tgc-edge && docker network connect tgc-edge reverse-proxy
 docker compose up -d --build

@@ -1,9 +1,12 @@
 """telegram-client MCP — the owner's own Telegram account (Telethon user session) over MCP.
 
 Reads: list_dialogs, find_peer, read_history, search_chat, get_media.
-Writes: send_message only, and only after the owner taps ✅ on the card the
-approval bot puts in front of him (approvals.py). The agent cannot approve its
-own draft, and the owner can /lock everything from Telegram.
+Writes: send_message only. Two modes (TGC_SEND_APPROVAL):
+  on  (default) — every send is a draft the owner approves with a tap in the
+        control bot (approvals.py); the agent cannot approve its own draft.
+  off — send_message sends at once; the control bot logs each send silently.
+Either way the owner can /lock everything from Telegram, and the agent-facing
+text (instructions, tool descriptions) describes only the active mode.
 
 Never exposed: login, logout, session management, deleting or editing
 messages, Telegram's service chat (login codes), the approval bot's chat and,
@@ -43,7 +46,7 @@ from starlette.responses import JSONResponse  # noqa: E402
 from starlette.routing import Mount, Route  # noqa: E402
 
 import tg  # noqa: E402
-from approvals import LOCKED_MSG, Approvals, Draft  # noqa: E402
+from approvals import LOCKED_MSG, RULE, Approvals, Draft  # noqa: E402
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -78,6 +81,8 @@ API_HASH = _required("TG_API_HASH")
 OWNER_ID = int(_required("TGC_OWNER_ID"))
 BOT_TOKEN = _required("APPROVAL_BOT_TOKEN")
 
+SEND_APPROVAL = tg.env_bool("TGC_SEND_APPROVAL", True)   # off: sends go out without a tap
+NOTIFY_SENDS = tg.env_bool("TGC_NOTIFY_SENDS", True)      # off-mode: silent log line per send
 APPROVAL_TTL_S = 60 * float(os.getenv("APPROVAL_TTL_MIN", "30"))
 APPROVAL_WAIT_S = float(os.getenv("APPROVAL_WAIT_S", "75"))
 NOTIFY_READS = tg.env_bool("TGC_NOTIFY_READS")
@@ -125,7 +130,8 @@ logging.getLogger("mcp.server.streamable_http").addFilter(_StreamErrorFilter())
 # ── state ────────────────────────────────────────────────────────────────────
 policy = tg.Policy.from_env()
 sendlog = tg.SendLog()
-approvals = Approvals(BOT_TOKEN, OWNER_ID, state_file=tg.DATA_DIR / "state.json", ttl_s=APPROVAL_TTL_S)
+approvals = Approvals(BOT_TOKEN, OWNER_ID, state_file=tg.DATA_DIR / "state.json", ttl_s=APPROVAL_TTL_S,
+                      approval_mode=SEND_APPROVAL)
 
 
 async def _on_session_dead(reason: str) -> None:
@@ -179,8 +185,11 @@ async def _status_text() -> str:
     except Exception as e:
         lines.append(f"session: ⚠️ unreachable — {type(e).__name__}: {e}")
     lines.append("lock: 🔒 LOCKED (/unlock)" if approvals.locked else "lock: 🔓 open")
-    pend = [d for d in approvals.drafts.values() if d.status == "pending"]
-    lines.append(f"pending drafts: {len(pend)}")
+    if SEND_APPROVAL:
+        pend = [d for d in approvals.drafts.values() if d.status == "pending"]
+        lines.append(f"sends: need your ✅ · pending drafts: {len(pend)}")
+    else:
+        lines.append("sends: direct, no approval (TGC_SEND_APPROVAL=false)")
     lines.append(sendlog.summary())
     recent = _recent_audit()
     if recent:
@@ -210,7 +219,7 @@ async def _execute_draft(d: Draft) -> str:
 approvals.executor = _execute_draft
 
 # ── MCP ──────────────────────────────────────────────────────────────────────
-INSTRUCTIONS = """\
+_READING = """\
 This server acts as the owner's OWN Telegram account (a user session, not a bot).
 
 Reading: list_dialogs -> find_peer -> read_history / search_chat -> get_media. Reading is
@@ -218,9 +227,11 @@ silent (no read receipts). Transcript lines are `#<id> [date] <who>: <text>`; `m
 owner, `↩#id` a reply, `[fwd from …]` a forward; media appear as tags like `[photo]` or
 `[file brief.pdf 2.1MB]`. Look at photos and screenshots with get_media(peer, [ids]) — that
 is often where the real requirements are — and read text/PDF documents the same way.
-Voice notes are not transcribed: say so. Telegram's service chat, the approval bot and (by
-default) Saved Messages are never accessible.
+Voice notes are not transcribed: say so. Telegram's service chat, this server's control
+bot and (by default) Saved Messages are never accessible.
+"""
 
+_SENDING_APPROVAL = """
 Sending: send_message never sends by itself. It creates a draft and the owner gets a card
 in Telegram with ✅ / ❌; only his tap sends it.
 1. Draft exactly the text you mean — the owner approves this text, not an intention.
@@ -231,10 +242,28 @@ in Telegram with ✅ / ❌; only his tap sends it.
    Budgets (per hour, per day, new contacts per day) are enforced by the server.
 4. Match how the owner writes in that chat (language, tone, length). Short and human,
    plain text for DMs; Telethon markdown (**bold**, __italic__, `code`) unless plain=true.
+"""
 
+_SENDING_DIRECT = """
+Sending: send_message delivers the message immediately, from the owner's account and in
+his name. The owner has authorized you to send on his behalf: no confirmation step exists,
+so do not wait for one or ask the server for one. A sent message is final.
+1. Send only what the task calls for, to the people it is about.
+2. One call = one message, delivered on success. Never repeat a call that succeeded; if a
+   call fails, read the error before deciding to try again — never retry in a loop.
+3. A first message to someone with no prior chat needs allow_new=true AND an explicit
+   request from the owner to contact that person. Budgets (per hour, per day, new contacts
+   per day) are enforced by the server.
+4. Match how the owner writes in that chat (language, tone, length). Short and human,
+   plain text for DMs; Telethon markdown (**bold**, __italic__, `code`) unless plain=true.
+"""
+
+_TROUBLE = """
 If a tool says the server is locked, stop: the owner locked it from Telegram on purpose.
 If it says not logged in or the session was revoked, tell the owner; never retry in a loop.
 """
+
+INSTRUCTIONS = _READING + (_SENDING_APPROVAL if SEND_APPROVAL else _SENDING_DIRECT) + _TROUBLE
 
 _allowed_hosts = ["localhost", "127.0.0.1", "0.0.0.0", _safe_name, f"mcp-{_safe_name}"]
 _allowed_hosts += [f"{h}:*" for h in list(_allowed_hosts)]
@@ -256,7 +285,7 @@ mcp = FastMCP(
 )
 
 
-async def _guarded(tool: str, peer: str, fn, *, read: bool = True):
+async def _guarded(tool: str, peer: str, fn, *, read: bool = True, audit_ok: bool = True):
     """Lock check, session, error mapping and audit around every Telegram-touching tool."""
     if approvals.locked:
         _audit(tool, peer, "refused: locked")
@@ -279,7 +308,8 @@ async def _guarded(tool: str, peer: str, fn, *, read: bool = True):
     except tg.errors.FloodWaitError as e:
         _audit(tool, peer, f"flood wait {e.seconds}s")
         raise ToolError(f"Telegram flood wait {e.seconds}s — try much later; do not loop.")
-    _audit(tool, peer, "ok")
+    if audit_ok:
+        _audit(tool, peer, "ok")
     if read and NOTIFY_READS:
         approvals.notify_bg(f"👁 {tool}: {peer}")
     return out
@@ -288,7 +318,8 @@ async def _guarded(tool: str, peer: str, fn, *, read: bool = True):
 @mcp.tool()
 async def whoami() -> str:
     """Which Telegram account this server acts as, whether its session is live, whether the
-    owner has locked the server, and the send budget left. Call it first when anything fails."""
+    owner has locked the server, how sending works, and the send budget left. Call it first
+    when anything fails."""
     lines = []
     try:
         if approvals.locked:
@@ -299,9 +330,13 @@ async def whoami() -> str:
     except tg.Fail as e:
         lines.append(f"Session: {account.state} — {e}")
     lines.append(sendlog.summary())
-    pend = [d.id for d in approvals.drafts.values() if d.status == "pending"]
-    if pend:
-        lines.append(f"Drafts waiting for the owner: {', '.join(pend)}")
+    if SEND_APPROVAL:
+        lines.append("Sending: each message waits for the owner's ✅ in Telegram.")
+        pend = [d.id for d in approvals.drafts.values() if d.status == "pending"]
+        if pend:
+            lines.append(f"Drafts waiting for the owner: {', '.join(pend)}")
+    else:
+        lines.append("Sending: send_message delivers immediately; no confirmation step.")
     return "\n".join(lines)
 
 
@@ -531,13 +566,7 @@ def _describe(d: Draft) -> str:
     return f"⚠️ Draft {d.id} was approved but sending failed: {d.result}"
 
 
-@mcp.tool()
-async def send_message(peer: str, text: str, reply_to: int = 0, plain: bool = False,
-                       silent: bool = False, no_preview: bool = False, allow_new: bool = False) -> str:
-    """Ask the owner to send `text` to `peer` from his account. Creates a draft; the owner gets a
-    card in Telegram with the exact recipient and text and ✅ / ❌. Only his tap sends it.
-    Waits up to ~75 s for the decision, then returns the draft id — poll send_status, never resubmit.
-
+_SEND_ARGS = """
     Args:
         peer: as in read_history.
         text: the exact message (max 3500 chars). Telethon markdown unless plain=true.
@@ -547,36 +576,69 @@ async def send_message(peer: str, text: str, reply_to: int = 0, plain: bool = Fa
         no_preview: no link preview.
         allow_new: allow a FIRST message to someone with no prior chat — only when the owner
             explicitly asked to contact that person.
-    """
+"""
+SEND_DESC_APPROVAL = (
+    "Ask the owner to send `text` to `peer` from his account. Creates a draft; the owner gets a\n"
+    "card in Telegram with the exact recipient and text and ✅ / ❌. Only his tap sends it.\n"
+    "Waits up to ~75 s for the decision, then returns the draft id — poll send_status, never resubmit.\n"
+    + _SEND_ARGS)
+SEND_DESC_DIRECT = (
+    "Send `text` to `peer` from the owner's account, immediately, in his name. On success the\n"
+    "message is already delivered (the result gives its id) and is final; nothing else is needed.\n"
+    + _SEND_ARGS)
+
+
+async def send_message(peer: str, text: str, reply_to: int = 0, plain: bool = False,
+                       silent: bool = False, no_preview: bool = False, allow_new: bool = False) -> str:
     body = (text or "").strip("\n")
     if not body.strip():
         raise ToolError("empty message")
     if tg.ulen(body) > MAX_DRAFT_CHARS:
         raise ToolError(f"text is {tg.ulen(body)} chars; the limit is {MAX_DRAFT_CHARS} (one message). "
-                        "Shorten it, or send separate messages, each approved on its own.")
+                        "Shorten it, or split it into separate messages.")
 
-    async def run(client):
+    async def prepare(client):
         entity = await tg.resolve_peer(client, peer, policy)
-        pid = tg.peer_id(entity)
         prior = await client.get_messages(entity, limit=1)
         is_new = len(prior) == 0 and tg.kind_of(entity) in ("user", "bot")
         if is_new and not allow_new:
             raise tg.Fail(f"No prior conversation with {tg.label(entity)}. A first message to a stranger "
                           "needs allow_new=true, and only when the owner explicitly asked to contact them.")
-        sendlog.check(1, pid, is_new)
-        d = Draft(peer_label=tg.label(entity), peer_id=pid, text=body, reply_to=reply_to or None,
-                  plain=plain, silent=silent, no_preview=no_preview, is_new=is_new, entity=entity)
+        sendlog.check(1, tg.peer_id(entity), is_new)
+        return entity, is_new
+
+    if not SEND_APPROVAL:
+        async def run_direct(client):
+            entity, is_new = await prepare(client)
+            msg = await tg.send_text(client, entity, body, reply_to=reply_to or None, plain=plain,
+                                     silent=silent, no_preview=no_preview, log=sendlog, is_new=is_new)
+            return entity, msg
+
+        entity, msg = await _guarded("send_message", peer, run_direct, read=False, audit_ok=False)
+        lbl = tg.label(entity)
+        _audit("send_message", lbl, f"sent #{msg.id}")
+        if NOTIFY_SENDS:
+            approvals.notify_bg(f"📤 Sent as you → {lbl} · #{msg.id}\n{RULE}\n{body}", silent=True)
+        return f"✅ Sent #{msg.id} to {lbl} at {tg.ts(msg.date)}."
+
+    async def run(client):
+        entity, is_new = await prepare(client)
+        d = Draft(peer_label=tg.label(entity), peer_id=tg.peer_id(entity), text=body,
+                  reply_to=reply_to or None, plain=plain, silent=silent, no_preview=no_preview,
+                  is_new=is_new, entity=entity)
         await approvals.submit(d)
         return d
 
-    d = await _guarded("send_message", peer, run, read=False)
+    d = await _guarded("send_message", peer, run, read=False, audit_ok=False)
     _audit("send_message", d.peer_label, f"draft {d.id} awaiting approval")
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(d.done.wait(), timeout=APPROVAL_WAIT_S)
     return _describe(d)
 
 
-@mcp.tool()
+mcp.tool(description=SEND_DESC_APPROVAL if SEND_APPROVAL else SEND_DESC_DIRECT)(send_message)
+
+
 async def send_status(draft_id: str, wait_seconds: int = 30) -> str:
     """State of a draft from send_message: waiting, sent, declined, withdrawn, expired or failed.
     While it is still waiting, blocks up to `wait_seconds` (max 75) for the owner's decision."""
@@ -590,7 +652,6 @@ async def send_status(draft_id: str, wait_seconds: int = 30) -> str:
     return _describe(d)
 
 
-@mcp.tool()
 async def cancel_send(draft_id: str) -> str:
     """Withdraw your own draft before the owner decides (e.g. the text turned out wrong)."""
     d = approvals.drafts.get((draft_id or "").strip())
@@ -599,6 +660,11 @@ async def cancel_send(draft_id: str) -> str:
     await approvals.withdraw(d)
     _audit("cancel_send", d.peer_label, f"draft {d.id}: {d.status}")
     return _describe(d)
+
+
+if SEND_APPROVAL:  # draft tools exist only where drafts do
+    mcp.tool()(send_status)
+    mcp.tool()(cancel_send)
 
 
 # ── app ──────────────────────────────────────────────────────────────────────
@@ -619,8 +685,10 @@ async def _watch_session() -> None:
                     await client.get_me()  # a revoked key fails here, not at the next tool call
                     last_full = time.time()
                 if first or was != "authorized":
+                    how = ("Sends wait for your ✅ here." if SEND_APPROVAL else
+                           "Sends go out directly; each is logged here silently. /lock stops everything.")
                     await approvals.notify(f"🟢 telegram-client is live as {tg.label(account.me)}. "
-                                           "Sends wait for your ✅ here; /help for commands.")
+                                           f"{how} /help for commands.")
             elif first or was == "authorized":
                 await approvals.notify(f"⚪ telegram-client is up but not logged in. On the VPS:\n\n{tg.LOGIN_CMD}",
                                        key="login", every_s=12 * 3600)
