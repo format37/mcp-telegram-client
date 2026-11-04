@@ -1,0 +1,53 @@
+# telegram-client MCP — https://mcp.latentstate.dev/telegram-client/<MCP_TOKEN>/
+#
+# Full access to the owner's Telegram account, so it is fenced harder than the other MCPs:
+#   - its own network `tgc-edge`, shared with Caddy only (not the busy `mcp-shared`);
+#   - read-only root filesystem, non-root user, no new privileges, pid/memory caps;
+#   - the session lives in a named volume, written only by login.py;
+#   - no host port: Caddy is the only way in, and every request needs an MCP token.
+#
+# Once per host:
+#   docker network create tgc-edge && docker network connect tgc-edge reverse-proxy
+# Deploy / update:
+#   docker compose up -d --build
+# Log in (in a real terminal; QR + 2FA):
+#   sudo docker exec -it mcp-telegram-client python login.py
+services:
+  mcp-telegram-client:
+    build: ./backend
+    image: mcp-telegram-client:latest
+    container_name: mcp-telegram-client
+    env_file: .env
+    environment:
+      - PORT=8023
+      - MCP_NAME=telegram-client
+      - DATA_DIR=/app/data
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-mcp.latentstate.dev}
+    expose:
+      - "8023"
+    volumes:
+      - tgc-data:/app/data
+    networks:
+      - tgc-edge
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 128
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  tgc-data:
+
+networks:
+  tgc-edge:
+    external: true

@@ -1,0 +1,18 @@
+# secrets — this repository is public
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+session.string*
+session.dead-*
+data/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# local tooling
+.claude/

@@ -1,0 +1,14 @@
+# Telegram MTProto user session (same stable 1.x line as the telegram-client skill and linkedin)
+telethon==1.44.0
+# QR login (login.py)
+qrcode>=7.4
+# MCP server — pinned to the version the kindle MCP runs in production with the same patterns
+mcp==1.29.0
+uvicorn>=0.32
+starlette>=0.41
+# Bot API (approvals) — already a dependency of mcp, pinned here because we use it directly
+httpx>=0.27
+# get_media: downscale photos, extract PDF text
+pillow>=11.0
+pypdf>=5.0
+python-dotenv>=1.0
