@@ -81,6 +81,7 @@ def test_mcp_round_trip_without_a_session(live):
     assert r.status_code == 200, r.text
     init = r.json()["result"]
     assert "draft" in init["instructions"].lower()  # approval mode (the default) is described
+    assert "upload_link()" in init["instructions"] and "files=[ids]" in init["instructions"]
     sid = r.headers.get("mcp-session-id")
     c.post(f"/telegram-client/{TOKEN}/", headers={**HDRS, "mcp-session-id": sid},
            json={"jsonrpc": "2.0", "method": "notifications/initialized"})

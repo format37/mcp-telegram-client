@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SESSION_FILE = DATA_DIR / "session.string"
 DEVICE_MODEL = os.getenv("DEVICE_MODEL", "telegram-client MCP")  # name in Settings -> Devices
-APP_VERSION = "tgc-mcp 1.0"
+APP_VERSION = "tgc-mcp 1.1"
 DIALOG_SCAN = 500
 LOGIN_CMD = "sudo docker exec -it mcp-telegram-client python login.py"
 

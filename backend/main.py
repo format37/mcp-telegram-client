@@ -1,7 +1,9 @@
 """telegram-client MCP — the owner's own Telegram account (Telethon user session) over MCP.
 
 Reads: list_dialogs, find_peer, read_history, search_chat, get_media.
-Writes: send_message only. Two modes (TGC_SEND_APPROVAL):
+Writes: send_message only, text and files. Files reach it through upload_link: the agent
+uploads with curl to a short-lived ticket URL (uploads.py), which sends nothing by itself.
+Two modes (TGC_SEND_APPROVAL):
   on  (default) — every send is a draft the owner approves with a tap in the
         control bot (approvals.py); the agent cannot approve its own draft.
   off — send_message sends at once; the control bot logs each send silently.
@@ -360,12 +362,21 @@ so do not wait for one or ask the server for one. A sent message is final.
    plain text for DMs; Telethon markdown (**bold**, __italic__, `code`) unless plain=true.
 """
 
+_FILES = """
+Files (charts, PDFs, photos, audio, anything you made): upload_link() gives a URL; upload each
+file from your shell with the curl line it shows, which prints one JSON line per file (id, size,
+sha256, kind); then send_message(peer, text, files=[ids]). An upload id is not a message:
+nothing is sent until send_message. By default photos go compressed and several files go as one
+album; as_file=true sends the original files at full resolution, album=false one message per
+file. When integrity matters, compare sha256 with `sha256sum`.
+"""
+
 _TROUBLE = """
 If a tool says the server is locked, stop: the owner locked it from Telegram on purpose.
 If it says not logged in or the session was revoked, tell the owner; never retry in a loop.
 """
 
-INSTRUCTIONS = _READING + (_SENDING_APPROVAL if SEND_APPROVAL else _SENDING_DIRECT) + _TROUBLE
+INSTRUCTIONS = _READING + (_SENDING_APPROVAL if SEND_APPROVAL else _SENDING_DIRECT) + _FILES + _TROUBLE
 
 _allowed_hosts = ["localhost", "127.0.0.1", "0.0.0.0", _safe_name, f"mcp-{_safe_name}"]
 _allowed_hosts += [f"{h}:*" for h in list(_allowed_hosts)]

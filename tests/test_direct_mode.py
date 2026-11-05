@@ -37,6 +37,7 @@ def test_agent_facing_text_has_no_approval_vocabulary(probe):
             assert word not in low, f"{where!r} mentions {word!r}"
     assert "immediately" in probe["tools"]["send_message"]
     assert "no confirmation step" in probe["instructions"]
+    assert "upload_link()" in probe["instructions"] and "files=[ids]" in probe["instructions"]
 
 
 def test_send_goes_out_at_once_without_a_draft(probe):

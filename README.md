@@ -9,3 +9,23 @@ sudo docker exec -it mcp-telegram-client python login.py
 Scan the QR in Telegram > Settings > Devices > Link Desktop Device; the bot says "live".
 
 Connector URL: `https://<host>/telegram-client/<MCP_TOKEN>/`
+
+## Files
+
+An agent with a shell sends files in three steps:
+
+1. `upload_link()` returns a short-lived upload URL and the exact curl line.
+2. `curl -sS -T /path/to/file https://<host>/telegram-client/upload/<ticket>/` uploads one file
+   (`-T "{a.png,b.pdf}"` uploads several) and prints one JSON line per file: `id`, `size`, `sha256`, `kind`.
+3. `send_message(peer, text, files=[ids], as_file=false, album=true)` sends them, through the same
+   approval (or direct mode) as text.
+
+Uploads stay 2 hours in the `tgc-data` volume (`UPLOAD_*` in `.env.example`). The upload route takes
+no MCP token: the ticket in its path is the credential, valid 15 minutes for up to 20 files, and it
+can only add files, never send.
+
+Known limit: the image has no ffmpeg, so a video sent as media has no thumbnail and shows no duration,
+and audio shows 0:00 until played. `as_file=true` sends them as plain files.
+
+Prerequisite: agents in sandboxes with an egress allow-list (Claude cloud sessions such as Duet) need
+the upload host, `mcp.latentstate.dev` here, on that list.
