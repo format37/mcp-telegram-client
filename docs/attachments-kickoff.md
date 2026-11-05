@@ -1,9 +1,10 @@
 # Kickoff: file attachments for `send_message`
 
 Status: design agreed on 2026-11-05 between the owner and Claude, revised the
-same day after Duet's review (issue #1). Not started. This is the brief for the
-implementing session. Everything under "Decisions" is settled unless the owner
-edits it here first.
+same day after Duet's review (issue #1). Implemented and deployed the same day
+(86b26df..), preview button included; what the real account showed is under
+"Step 5 results" near the end. Open: the upload test from a Duet cloud session.
+This was the brief for the implementing session.
 
 ## Goal
 
@@ -343,6 +344,30 @@ keep every existing test green.
 6. The preview button, if it was not done in step 3.
 
 Small commits on `main`, as before.
+
+## Step 5 results (2026-11-05)
+
+Production runs with `TGC_SEND_APPROVAL=false`, so the sends went out directly,
+to the owner's own @id37bot. The control bot's chat cannot take them: the
+server blocks it by design.
+
+- From Claude Code on the owner's machine, through Caddy: a 1 MB and a 95 MB
+  upload, both with sha256 equal to `sha256sum`; 95 MB took 19 s. An upload
+  over the 100 MB cap gets the JSON 413 after 64 KB, so curl never sends the
+  body. The access log shows `/upload/***/`.
+- Real curl names: `my chart.png` and `отчёт.pdf` arrived under those names.
+- A photo, a PDF and a GIF with `as_file=true` arrived as one album of files,
+  the GIF kept as a file. A photo alone arrived compressed, markdown caption
+  parsed.
+- Audio and video sent with duration 0 showed 0:04: Telegram measures the
+  duration itself, so that part of the "known limitation" does not hold.
+- A GIF now goes with `documentAttributeImageSize` and
+  `documentAttributeAnimated`, as Telegram Desktop sends it; Telethon adds
+  neither. A 250 KB ffmpeg GIF then arrived as an MP4 animation. A 4.6 KB
+  two-colour test GIF stayed a plain file however it was sent.
+- A 95 MB file went to Telegram in 140 s; the container peaked at 111 MiB of
+  its 512 MiB.
+- A restart rebuilt the upload index from the sidecars (7 files kept).
 
 ## Later, not now
 

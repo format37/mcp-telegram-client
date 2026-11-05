@@ -700,8 +700,10 @@ async def send_files(client, entity, paths, *, caption: str | None, as_file: boo
             video = any(plan.modes[i] == "video" for i in batch)
             extra = {}
             if plan.modes[batch[0]] == "animation":  # a GIF, always alone
-                # As Telegram Desktop sends one: image size + Animated. Telethon sends neither,
-                # and Telegram then keeps the image/gif a plain file (seen on the real account).
+                # As the API docs ask (Animated) and Telegram Desktop sends it (plus the image
+                # size); Telethon adds neither. Telegram then converts the GIF to an MP4
+                # animation: seen with a 250 KB ffmpeg GIF. A 4.6 KB two-colour test GIF stayed
+                # a plain file however it was sent.
                 g = infos[batch[0]]
                 extra["attributes"] = [T.DocumentAttributeImageSize(g.width, g.height), T.DocumentAttributeAnimated()]
             res = await client.send_file(
