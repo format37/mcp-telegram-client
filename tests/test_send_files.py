@@ -140,10 +140,11 @@ def test_a_gif_alone_is_one_animation_and_as_file_makes_a_file_album(files, log)
     send(c, files("loop.gif"), log)
     ((f, kw),) = c.calls
     assert names(f) == ["loop.gif"] and not isinstance(f, list) and kw["force_document"] is False
+    assert [type(a) for a in kw["attributes"]] == [T.DocumentAttributeAnimated]
     c = FakeClient()
     send(c, files("chart.png", "loop.gif"), log, as_file=True)
     ((f, kw),) = c.calls
-    assert names(f) == ["chart.png", "loop.gif"] and kw["force_document"] is True
+    assert names(f) == ["chart.png", "loop.gif"] and kw["force_document"] is True and "attributes" not in kw
 
 
 def test_album_false_is_one_message_each_paced_and_counted(files, log, monkeypatch):
@@ -274,10 +275,11 @@ def test_real_telethon_builds_the_requests_we_rely_on(tmp_path, log):
     assert isinstance(m, T.InputMediaUploadedDocument) and m.mime_type == "image/png"
     m, _ = run("a.webp")
     assert m.force_file is True  # never a sticker
-    m, _ = run("loop.gif")
-    assert m.mime_type == "image/gif" and not m.force_file  # Telegram turns it into an animation
+    m, _ = run("loop.gif")  # an animation: image/gif with the Animated attribute, as TDLib sends it
+    assert m.mime_type == "image/gif" and not m.force_file and attr(m, T.DocumentAttributeAnimated)
+    assert attr(m, T.DocumentAttributeFilename).file_name == "loop.gif"
     m, _ = run("loop.gif", as_file=True)
-    assert m.force_file is True
+    assert m.force_file is True and attr(m, T.DocumentAttributeAnimated) is None
     m, _ = run("clip.mkv")
     assert m.mime_type == "video/x-matroska" and m.nosound_video is True
     assert attr(m, T.DocumentAttributeVideo).supports_streaming is True

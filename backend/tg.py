@@ -655,7 +655,8 @@ def caption_len(text: str, plain: bool) -> int:
 async def _upload_arg(client, path: str, info: FileInfo, mode: str):
     """What send_file gets for one file: the path, except for audio. Without hachoir Telethon
     attaches no audio attribute and an .mp3 arrives as a plain file, so audio goes up first and
-    is sent as media carrying that attribute (duration unknown, 0)."""
+    is sent as media carrying that attribute. Its duration is sent as 0; Telegram measures the
+    real one itself (an mp3 sent so on 2026-11-05 showed 0:04)."""
     if mode != "audio":
         return path
     handle = await client.upload_file(path)
@@ -684,11 +685,14 @@ async def send_files(client, entity, paths, *, caption: str | None, as_file: boo
             await log.pace()
             items = [await _upload_arg(client, paths[i], infos[i], plan.modes[i]) for i in batch]
             video = any(plan.modes[i] == "video" for i in batch)
+            # A GIF (always alone) needs the Animated attribute, as TDLib sends it: without it
+            # Telegram keeps an image/gif as a plain file (seen on the real account).
+            extra = {"attributes": [T.DocumentAttributeAnimated()]} if plan.modes[batch[0]] == "animation" else {}
             res = await client.send_file(
                 entity, items if len(items) > 1 else items[0], caption=caption if k == 0 else None,
                 parse_mode=None if plain else "md", reply_to=reply_to or None, silent=silent,
                 force_document=plan.modes[batch[0]] == "document",  # a batch is all files or none
-                supports_streaming=video, nosound_video=True if video else None)
+                supports_streaming=video, nosound_video=True if video else None, **extra)
             # Telethon returns None for a message it cannot match in Telegram's answer. The
             # send still happened: count it, never report it as not sent.
             msgs = [m for m in (res if isinstance(res, list) else [res]) if m is not None]

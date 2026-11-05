@@ -24,8 +24,8 @@ Uploads stay 2 hours in the `tgc-data` volume (`UPLOAD_*` in `.env.example`). Th
 no MCP token: the ticket in its path is the credential, valid 15 minutes for up to 20 files, and it
 can only add files, never send.
 
-Known limit: the image has no ffmpeg, so a video sent as media has no thumbnail and shows no duration,
-and audio shows 0:00 until played. `as_file=true` sends them as plain files.
+Telegram measures the duration of audio and video itself. The image has no ffmpeg, so this server
+sends no video thumbnail of its own; `as_file=true` sends any file as a plain document.
 
 Prerequisite: agents in sandboxes with an egress allow-list (Claude cloud sessions such as Duet) need
 the upload host, `mcp.latentstate.dev` here, on that list.
