@@ -488,6 +488,22 @@ class SendLog:
         write_private(self.path, "".join(json.dumps(r) + "\n" for r in keep))
 
 
+def _send_failure(e: Exception, entity, log: SendLog) -> Fail | None:
+    """The caller-facing Fail for a Telegram error raised by a send, or None if it is not one.
+    A flood wait or PeerFlood pauses every send. Call only after UNAUTHORIZED has been re-raised."""
+    if isinstance(e, errors.FloodWaitError):
+        log.record_flood(e.seconds)
+        return Fail(f"Telegram flood wait {e.seconds}s — sends paused for that long. Do not retry in a loop.")
+    if isinstance(e, errors.PeerFloodError):
+        log.record_flood(24 * 3600)
+        return Fail("PeerFlood: Telegram flagged this account for spam-like activity. Sends paused for 24h.")
+    if isinstance(e, (errors.UserPrivacyRestrictedError, errors.UserIsBlockedError, errors.ChatWriteForbiddenError)):
+        return Fail(f"Cannot write to {label(entity)}: {type(e).__name__}")
+    if isinstance(e, errors.RPCError):
+        return Fail(f"Telegram refused it: {type(e).__name__} ({e})")
+    return None
+
+
 async def send_text(client, entity, text: str, *, reply_to: int | None, plain: bool, silent: bool,
                     no_preview: bool, log: SendLog, is_new: bool):
     """One message, paced and preceded by a short 'typing…'. Flood errors pause all sends."""
@@ -499,14 +515,10 @@ async def send_text(client, entity, text: str, *, reply_to: int | None, plain: b
         msg = await client.send_message(entity, text, reply_to=reply_to or None,
                                         parse_mode=None if plain else "md", silent=silent,
                                         link_preview=not no_preview)
-    except errors.FloodWaitError as e:
-        log.record_flood(e.seconds)
-        raise Fail(f"Telegram flood wait {e.seconds}s — sends paused for that long. Do not retry in a loop.")
-    except errors.PeerFloodError:
-        log.record_flood(24 * 3600)
-        raise Fail("PeerFlood: Telegram flagged this account for spam-like activity. Sends paused for 24h.")
-    except (errors.UserPrivacyRestrictedError, errors.UserIsBlockedError, errors.ChatWriteForbiddenError) as e:
-        raise Fail(f"Cannot write to {label(entity)}: {type(e).__name__}")
+    except UNAUTHORIZED:
+        raise
+    except errors.RPCError as e:
+        raise _send_failure(e, entity, log) from e
     log.record(pid, msg.id, is_new)
     return msg
 
@@ -570,6 +582,136 @@ def probe(path, name: str | None = None) -> FileInfo:
             return FileInfo(mime, "document")
         return FileInfo(mime, kind, *dims)
     return FileInfo(mime, kind)
+
+
+# ── sending files ────────────────────────────────────────────────────────────
+ALBUM_MAX = 10
+PHOTO_MAX_BYTES = 10_000_000   # Telegram's limits for a photo; past them it goes as a file.
+PHOTO_MAX_SIDES = 10_000       # width + height. Telethon decodes and shrinks photos over 2560 px,
+PHOTO_MAX_RATIO = 20           # so these also bound that decode at about 5000 x 5000.
+MODE_WORD = {"photo": "photo", "video": "video", "audio": "audio", "animation": "GIF", "document": "file"}
+_ALBUM_GROUP = {"photo": "media", "video": "media", "audio": "audio", "document": "document"}  # a GIF: none
+
+
+def photo_refusal(size: int, width: int | None, height: int | None) -> str:
+    """Why Telegram would not take this image as a photo, or ''."""
+    if size > PHOTO_MAX_BYTES:
+        return "over 10 MB, too big for a photo"
+    if not (width and height):
+        return "no readable image header"
+    if width + height > PHOTO_MAX_SIDES:
+        return f"{width}x{height} is past the photo limit (width + height at most 10000 px)"
+    if max(width, height) > PHOTO_MAX_RATIO * min(width, height):
+        return f"{width}x{height} is too narrow for a photo (more than 20:1)"
+    return ""
+
+
+def send_mode(info: FileInfo, size: int, as_file: bool) -> tuple[str, str]:
+    """How one file goes out, (photo | video | audio | animation | document, note): the note
+    says why a photo goes as a file. as_file sends everything as a file, original bytes."""
+    if as_file:
+        return "document", ""
+    if info.kind == "photo":
+        why = photo_refusal(size, info.width, info.height)
+        return ("document", why) if why else ("photo", "")
+    return {"video": "video", "audio": "audio", "gif": "animation"}.get(info.kind, "document"), ""
+
+
+@dataclass
+class FilePlan:
+    modes: list[str]            # per file, see send_mode
+    notes: list[str]            # per file: why a photo goes as a file
+    batches: list[list[int]]    # file indexes per Telegram message: an album, or one file
+
+
+def plan_files(files: list[tuple[str, int, FileInfo]], *, as_file: bool, album: bool) -> FilePlan:
+    """Group (name, size, info) files into messages. Telegram puts photos and videos together,
+    audio only with audio, files only with files, at most 10 per album, and never a GIF."""
+    pairs = [send_mode(info, size, as_file) for _, size, info in files]
+    modes, notes = [m for m, _ in pairs], [why for _, why in pairs]
+    n = len(files)
+    if not album or n == 1:
+        return FilePlan(modes, notes, [[i] for i in range(n)])
+    groups = {_ALBUM_GROUP.get(m) for m in modes}
+    if None in groups or len(groups) > 1:
+        each = ", ".join(f"{name} → {MODE_WORD[m]}" for (name, _, _), m in zip(files, modes))
+        raise Fail("These files cannot share an album: Telegram groups photos and videos together, audio "
+                   "only with audio and files only with files, and a GIF never joins an album. "
+                   f"Here: {each}. Send them with as_file=true (one album of files, original bytes) "
+                   "or with album=false (one message per file).")
+    return FilePlan(modes, notes, [list(range(i, min(i + ALBUM_MAX, n))) for i in range(0, n, ALBUM_MAX)])
+
+
+def caption_len(text: str, plain: bool) -> int:
+    """What Telegram counts against the caption limit: UTF-16 units of the text it stores,
+    i.e. after Telethon's markdown is parsed out (markup can be most of the raw length)."""
+    if not plain:
+        from telethon.extensions import markdown
+
+        text = markdown.parse(text)[0]
+    return ulen(text)
+
+
+async def _upload_arg(client, path: str, info: FileInfo, mode: str):
+    """What send_file gets for one file: the path, except for audio. Without hachoir Telethon
+    attaches no audio attribute and an .mp3 arrives as a plain file, so audio goes up first and
+    is sent as media carrying that attribute (duration unknown, 0)."""
+    if mode != "audio":
+        return path
+    handle = await client.upload_file(path)
+    return T.InputMediaUploadedDocument(
+        file=handle, mime_type=info.mime,
+        attributes=[T.DocumentAttributeAudio(duration=0),
+                    T.DocumentAttributeFilename(os.path.basename(path))])
+
+
+async def send_files(client, entity, paths, *, caption: str | None, as_file: bool, album: bool,
+                     reply_to: int | None, plain: bool, silent: bool, log: SendLog, is_new: bool) -> list[list]:
+    """Files as albums of up to 10, or one message per file; `caption` on the first message.
+    An album is one send for the budget. Returns the sent messages, one list per Telegram message.
+
+    Every path must end with the name the recipient should see: Telethon takes photo or
+    document, the mime type and the shown filename from it."""
+    paths = [str(p) for p in paths]
+    infos = [probe(p) for p in paths]
+    plan = plan_files([(os.path.basename(p), os.path.getsize(p), i) for p, i in zip(paths, infos)],
+                      as_file=as_file, album=album)
+    pid = peer_id(entity)
+    log.check(len(plan.batches), pid, is_new)
+    sent: list[list] = []
+    try:
+        for k, batch in enumerate(plan.batches):
+            await log.pace()
+            items = [await _upload_arg(client, paths[i], infos[i], plan.modes[i]) for i in batch]
+            video = any(plan.modes[i] == "video" for i in batch)
+            res = await client.send_file(
+                entity, items if len(items) > 1 else items[0], caption=caption if k == 0 else None,
+                parse_mode=None if plain else "md", reply_to=reply_to or None, silent=silent,
+                force_document=plan.modes[batch[0]] == "document",  # a batch is all files or none
+                supports_streaming=video, nosound_video=True if video else None)
+            # Telethon returns None for a message it cannot match in Telegram's answer. The
+            # send still happened: count it, never report it as not sent.
+            msgs = [m for m in (res if isinstance(res, list) else [res]) if m is not None]
+            log.record(pid, msgs[0].id if msgs else None, is_new)
+            sent.append(msgs)
+    except UNAUTHORIZED:
+        raise
+    except Exception as e:
+        fail = _send_failure(e, entity, log)
+        if fail is None:
+            logger.exception("sending files to %s failed", pid)
+            fail = Fail(f"Sending the files failed: {type(e).__name__}: {e}")
+        went = ", ".join(sent_ids(m) for m in sent)
+        raise Fail(f"{fail} " + (f"{len(sent)} of {len(plan.batches)} messages went out first ({went}); "
+                                 "do not send those again." if sent else "Nothing went out.")) from e
+    return sent
+
+
+def sent_ids(msgs: list) -> str:
+    """#101, or #101–#103 for an album; "id unknown" when Telethon could not say."""
+    if not msgs:
+        return "id unknown"
+    return f"#{msgs[0].id}" + (f"–#{msgs[-1].id}" if len(msgs) > 1 else "")
 
 
 # ── files ────────────────────────────────────────────────────────────────────

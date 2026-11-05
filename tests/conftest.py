@@ -5,8 +5,10 @@ environment when they are imported).
 """
 import json
 import os
+import struct
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 BACKEND = Path(os.getenv("TGC_BACKEND") or Path(__file__).resolve().parent.parent / "backend")
@@ -67,3 +69,11 @@ class FakeBotHTTP:
 
 def dumps(x):
     return json.dumps(x, ensure_ascii=False)
+
+
+def png(w, h):
+    """A valid PNG header claiming w x h pixels, with a sliver of pixel data that is never decoded."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\0" * 64)) + chunk(b"IEND", b""))

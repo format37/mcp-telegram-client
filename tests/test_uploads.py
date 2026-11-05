@@ -8,17 +8,15 @@ import os
 import resource
 import shutil
 import socket
-import struct
 import subprocess
 import threading
 import time
 import unicodedata
-import zlib
 from urllib.parse import quote, urlsplit
 
 import pytest
 import uvicorn
-from conftest import TOKEN
+from conftest import TOKEN, png
 from mcp.server.fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
@@ -71,14 +69,6 @@ def raw(base, path, data, method="PUT"):
     body = json.loads(r.read())
     conn.close()
     return r.status, body
-
-
-def png(w, h):
-    """A valid PNG header claiming w x h pixels, with a sliver of pixel data that is never decoded."""
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(b"\0" * 64)) + chunk(b"IEND", b""))
 
 
 def leftovers():
