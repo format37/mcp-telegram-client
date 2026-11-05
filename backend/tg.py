@@ -569,15 +569,28 @@ def image_size(path) -> tuple[int, int] | None:
     return (w, h) if 0 < w and 0 < h and w * h <= cap else None
 
 
+def gif_size(path) -> tuple[int, int] | None:
+    """The logical screen size from the 10-byte GIF header, or None if it is not a GIF."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(10)
+    except OSError:
+        return None
+    if len(head) < 10 or head[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    w, h = int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
+    return (w, h) if w and h else None
+
+
 def probe(path, name: str | None = None) -> FileInfo:
-    """Kind and mime type from the extension of `name` (default: the path's basename);
-    for a photo, its size from the image header. A .jpg/.jpeg/.png whose header does not
-    read cleanly is a document, so nothing ever hands it to Telethon's photo resize."""
+    """Kind and mime type from the extension of `name` (default: the path's basename); for a
+    photo or a GIF, its size from the header. A file whose header does not read cleanly is a
+    document, so nothing ever hands it to Telethon's photo resize or sends it as an animation."""
     ext = os.path.splitext(name or os.path.basename(path))[1].lower()
     mime = (mimetypes.guess_type("x" + ext)[0] if ext else None) or "application/octet-stream"
     kind = KIND_EXT.get(ext, "document")
-    if kind == "photo":
-        dims = image_size(path)
+    if kind in ("photo", "gif"):
+        dims = image_size(path) if kind == "photo" else gif_size(path)
         if dims is None:
             return FileInfo(mime, "document")
         return FileInfo(mime, kind, *dims)
@@ -685,9 +698,12 @@ async def send_files(client, entity, paths, *, caption: str | None, as_file: boo
             await log.pace()
             items = [await _upload_arg(client, paths[i], infos[i], plan.modes[i]) for i in batch]
             video = any(plan.modes[i] == "video" for i in batch)
-            # A GIF (always alone) needs the Animated attribute, as TDLib sends it: without it
-            # Telegram keeps an image/gif as a plain file (seen on the real account).
-            extra = {"attributes": [T.DocumentAttributeAnimated()]} if plan.modes[batch[0]] == "animation" else {}
+            extra = {}
+            if plan.modes[batch[0]] == "animation":  # a GIF, always alone
+                # As Telegram Desktop sends one: image size + Animated. Telethon sends neither,
+                # and Telegram then keeps the image/gif a plain file (seen on the real account).
+                g = infos[batch[0]]
+                extra["attributes"] = [T.DocumentAttributeImageSize(g.width, g.height), T.DocumentAttributeAnimated()]
             res = await client.send_file(
                 entity, items if len(items) > 1 else items[0], caption=caption if k == 0 else None,
                 parse_mode=None if plain else "md", reply_to=reply_to or None, silent=silent,

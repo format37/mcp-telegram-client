@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from conftest import png
+from conftest import gif, png
 from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
 from telethon.tl import types as T
@@ -86,6 +86,8 @@ def files(tmp_path):
                 p.write_bytes(data)
             elif n.endswith((".png", ".jpg")):
                 p.write_bytes(png(1600, 900))
+            elif n.endswith(".gif"):
+                p.write_bytes(gif(240, 180))
             else:
                 p.write_bytes(b"x" * 100)
             out.append(p)
@@ -140,7 +142,8 @@ def test_a_gif_alone_is_one_animation_and_as_file_makes_a_file_album(files, log)
     send(c, files("loop.gif"), log)
     ((f, kw),) = c.calls
     assert names(f) == ["loop.gif"] and not isinstance(f, list) and kw["force_document"] is False
-    assert [type(a) for a in kw["attributes"]] == [T.DocumentAttributeAnimated]
+    size, animated = kw["attributes"]
+    assert (size.w, size.h) == (240, 180) and isinstance(animated, T.DocumentAttributeAnimated)
     c = FakeClient()
     send(c, files("chart.png", "loop.gif"), log, as_file=True)
     ((f, kw),) = c.calls
@@ -275,10 +278,11 @@ def test_real_telethon_builds_the_requests_we_rely_on(tmp_path, log):
     assert isinstance(m, T.InputMediaUploadedDocument) and m.mime_type == "image/png"
     m, _ = run("a.webp")
     assert m.force_file is True  # never a sticker
-    m, _ = run("loop.gif")  # an animation: image/gif with the Animated attribute, as TDLib sends it
+    m, _ = run("loop.gif", gif(320, 240))  # image/gif + image size + Animated, as Telegram Desktop sends it
     assert m.mime_type == "image/gif" and not m.force_file and attr(m, T.DocumentAttributeAnimated)
+    assert (attr(m, T.DocumentAttributeImageSize).w, attr(m, T.DocumentAttributeImageSize).h) == (320, 240)
     assert attr(m, T.DocumentAttributeFilename).file_name == "loop.gif"
-    m, _ = run("loop.gif", as_file=True)
+    m, _ = run("loop.gif", gif(320, 240), as_file=True)
     assert m.force_file is True and attr(m, T.DocumentAttributeAnimated) is None
     m, _ = run("clip.mkv")
     assert m.mime_type == "video/x-matroska" and m.nosound_video is True
@@ -568,3 +572,14 @@ def test_a_photo_past_the_limits_is_noted_on_the_card_and_in_the_result(wired):
     why = "12000x800 is past the photo limit (width + height at most 10000 px)"
     assert f"panorama.png goes as a file: {why}." in out
     assert f"📎 panorama.png · {uploads.human(rec.size)} · file — {why}" in wired.bot.sent("sendMessage")[-1]["text"]
+
+
+def test_a_gif_gets_its_size_from_the_header_and_a_fake_one_is_a_file(tmp_path, log):
+    real, fake = tmp_path / "real.gif", tmp_path / "fake.gif"
+    real.write_bytes(gif(480, 270))
+    fake.write_bytes(b"not a gif at all")
+    assert (tg.probe(real).kind, tg.probe(real).width, tg.probe(real).height) == ("gif", 480, 270)
+    assert tg.probe(fake).kind == "document"
+    c = FakeClient()
+    send(c, [fake], log)
+    assert c.calls[0][1]["force_document"] is True and "attributes" not in c.calls[0][1]

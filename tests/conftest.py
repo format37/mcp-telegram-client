@@ -80,3 +80,8 @@ def png(w, h):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(b"\0" * 64)) + chunk(b"IEND", b""))
+
+
+def gif(w, h):
+    """A GIF header claiming w x h (logical screen), then the trailer: enough for the header probe."""
+    return b"GIF89a" + struct.pack("<HH", w, h) + b"\x00\x00\x00" + b"\x3b"
