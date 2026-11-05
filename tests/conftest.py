@@ -47,12 +47,15 @@ class FakeBotHTTP:
         self.bot_id = bot_id
         self._mid = 100
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, data=None, files=None):
         method = url.rsplit("/", 1)[-1]
-        self.calls.append((method, json or {}))
+        payload = dict(json or data or {})
+        for field, (name, fh, mime) in (files or {}).items():  # a multipart upload: keep what was sent
+            payload["_file"] = {"field": field, "name": name, "mime": mime, "bytes": fh.read()}
+        self.calls.append((method, payload))
         if method == "getMe":
             return FakeResp({"ok": True, "result": {"id": self.bot_id, "username": "tgc_test_bot"}})
-        if method == "sendMessage":
+        if method in ("sendMessage", "sendDocument"):
             self._mid += 1
             return FakeResp({"ok": True, "result": {"message_id": self._mid}})
         if method == "getUpdates":

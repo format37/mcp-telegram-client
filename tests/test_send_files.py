@@ -509,3 +509,60 @@ def test_the_card_fits_one_bot_message_at_twenty_long_names(wired):
     card = wired.bot.sent("sendMessage")[-1]["text"]
     assert len(card.encode("utf-16-le")) // 2 <= 4096 and card.count("📎") == 20
     assert "2 albums (10 + 10) · the text first, as its own message" in card  # over 1024: not a caption
+
+
+# ── the 👀 Files button ──────────────────────────────────────────────────────
+import approvals  # noqa: E402
+
+
+async def preview(d, who=OWNER):
+    await main.approvals.handle({"update_id": 2, "callback_query": {
+        "id": "p", "from": {"id": who}, "data": f"pv:{d.id}", "message": {"message_id": d.card_id}}})
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if d.id not in main.approvals._previewing:
+            return
+
+
+def test_preview_sends_the_owner_the_files_and_the_draft_stays_pending(wired):
+    a, b = upload("chart.png"), upload("отчёт.pdf", b"%PDF-1.4 x")
+
+    async def go():
+        _, plain = await submit("@ivan", "text only")
+        assert len(wired.bot.sent("sendMessage")[-1]["reply_markup"]["inline_keyboard"]) == 1
+        _, d = await submit("@ivan", "Look", files=[a.id, b.id], as_file=True)
+        rows = wired.bot.sent("sendMessage")[-1]["reply_markup"]["inline_keyboard"]
+        assert rows[1] == [{"text": "👀 Files", "callback_data": f"pv:{d.id}"}]
+        await preview(d, who=OWNER + 1)  # not the owner: nothing
+        assert wired.bot.sent("sendDocument") == []
+        await preview(d)
+        return d
+
+    d = asyncio.run(go())
+    docs = wired.bot.sent("sendDocument")
+    assert [x["_file"]["name"] for x in docs] == ["chart.png", "отчёт.pdf"]
+    assert docs[1]["_file"]["bytes"] == b"%PDF-1.4 x" and docs[1]["_file"]["mime"] == "application/pdf"
+    assert all(x["chat_id"] == str(OWNER) for x in docs) and docs[0]["caption"] == f"👀 Draft {d.id} · 1/2"
+    assert d.status == "pending" and wired.client.calls == []
+
+
+def test_preview_of_a_file_over_the_bot_limit_gives_its_size_and_sha256(wired, monkeypatch):
+    monkeypatch.setattr(approvals, "PREVIEW_MAX", 10)
+    rec = upload("big.pdf", b"x" * 100)
+
+    async def go():
+        _, d = await submit("@ivan", "", files=[rec.id])
+        await preview(d)
+
+    asyncio.run(go())
+    assert wired.bot.sent("sendDocument") == []
+    note = wired.bot.sent("sendMessage")[-1]["text"]
+    assert "big.pdf · 100 B is too big to preview here" in note and rec.sha256 in note
+
+
+def test_a_photo_past_the_limits_is_noted_on_the_card_and_in_the_result(wired):
+    rec = upload("panorama.png", png(12_000, 800))
+    out, d = asyncio.run(submit("@ivan", "", files=[rec.id]))
+    why = "12000x800 is past the photo limit (width + height at most 10000 px)"
+    assert f"panorama.png goes as a file: {why}." in out
+    assert f"📎 panorama.png · {uploads.human(rec.size)} · file — {why}" in wired.bot.sent("sendMessage")[-1]["text"]

@@ -322,6 +322,17 @@ async def _execute_draft(d: Draft) -> str:
 
 approvals.executor = _execute_draft
 
+
+def _preview_file(fid: str):
+    """For the card's 👀 Files button: (path, size, sha256, mime) of an upload, or None."""
+    rec = store.get(fid)
+    if rec is None or not store.path(rec).is_file():
+        return None
+    return store.path(rec), rec.size, rec.sha256, rec.mime
+
+
+approvals.preview_file = _preview_file
+
 # ── MCP ──────────────────────────────────────────────────────────────────────
 _READING = """\
 This server acts as the owner's OWN Telegram account (a user session, not a bot).
@@ -768,7 +779,7 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
     if missing:
         raise ToolError(f"Unknown or expired upload ids: {', '.join(missing)}. Nothing was sent. "
                         "list_uploads() shows the files still here; upload the others again.")
-    rows, grouping, text_first, n_msgs = [], "", False, 1
+    rows, grouping, text_first, n_msgs, as_files = [], "", False, 1, []
     if recs:
         try:
             plan = _plan(recs, as_file, album)
@@ -778,6 +789,7 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
         rows = _file_rows(recs, plan)
         grouping = _grouping(plan, album, "first" if text_first else "caption" if body else "")
         n_msgs = len(plan.batches) + text_first
+        as_files = [(r.name, why) for r, why in zip(recs, plan.notes) if why]  # photos that cannot be one
     limit = MAX_DRAFT_CHARS - (tg.ulen(files_block(rows, grouping)) if SEND_APPROVAL and rows else 0)
     if tg.ulen(body) > limit:
         why = "one message" if limit == MAX_DRAFT_CHARS else "the owner's card lists the files too"
@@ -812,7 +824,8 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
             if rows:
                 line += f"\n{RULE}\n{files_block(rows, grouping)}"
             approvals.notify_bg(line, silent=True)
-        return f"✅ Sent {sent} to {lbl} at {_when(first, batches)}" + (f" ({grouping})." if rows else ".")
+        return (f"✅ Sent {sent} to {lbl} at {_when(first, batches)}" + (f" ({grouping})." if rows else ".")
+                + "".join(f" {name} went as a file: {why}." for name, why in as_files))
 
     async def run(client):
         entity, is_new = await prepare(client)
@@ -830,7 +843,7 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
            f"draft {d.id} awaiting approval" + (f" ({len(rows)} files)" if rows else ""))
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(d.done.wait(), timeout=APPROVAL_WAIT_S)
-    return _describe(d)
+    return _describe(d) + "".join(f" {name} goes as a file: {why}." for name, why in as_files)
 
 
 mcp.tool(description=SEND_DESC_APPROVAL if SEND_APPROVAL else SEND_DESC_DIRECT)(send_message)

@@ -33,13 +33,15 @@ from tg import Fail, write_private
 logger = logging.getLogger(__name__)
 
 BOT_API = "https://api.telegram.org"
+PREVIEW_MAX = 50_000_000  # the Bot API takes uploads of up to 50 MB
 LOCKED_MSG = ("🔒 The owner has locked telegram-client from Telegram. Every tool refuses until he "
               "unlocks it. Stop and tell the user; do not retry.")
 RULE = "━━━━━━━━━━━━"
 
 
 def help_text(approval_mode: bool) -> str:
-    sends = ("Drafts arrive here with ✅ Send / ❌ Cancel. Nothing is sent without your tap.\n\n"
+    sends = ("Drafts arrive here with ✅ Send / ❌ Cancel; one with files also has 👀 Files, which "
+             "sends you the files themselves first. Nothing is sent without your tap.\n\n"
              "/pending — drafts waiting for you\n" if approval_mode else
              "Sends go out directly (TGC_SEND_APPROVAL=false); each one is logged here silently.\n\n")
     return ("telegram-client control bot\n\n" + sends +
@@ -150,6 +152,8 @@ class Approvals:
         self.drafts: dict[str, Draft] = {}
         self.executor: Callable[[Draft], Awaitable[str]] | None = None  # performs an approved send
         self.status_fn: Callable[[], Awaitable[str]] | None = None      # text for /status
+        # file id -> (path, size, sha256, mime) or None: what the 👀 Files button sends the owner
+        self.preview_file: Callable[[str], tuple | None] | None = None
         self.bot_id: int | None = None
         self.bot_username: str | None = None
         self.locked = self._load_locked()
@@ -157,10 +161,23 @@ class Approvals:
         self._submits: list[float] = []
         self._alerts: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
+        self._previewing: set[str] = set()
 
     # ── bot api ──────────────────────────────────────────────────────────────
     async def api(self, method: str, **params) -> Any:
         r = await self.http.post(f"{BOT_API}/bot{self.token}/{method}", json=params)
+        return self._result(method, r)
+
+    async def api_file(self, method: str, field: str, path, name: str, mime: str, **params) -> Any:
+        """A Bot API call that uploads one file as multipart, streamed from disk."""
+        form = {k: v if isinstance(v, str) else json.dumps(v) for k, v in params.items()}
+        with open(path, "rb") as fh:
+            r = await self.http.post(f"{BOT_API}/bot{self.token}/{method}", data=form,
+                                     files={field: (name, fh, mime)})
+        return self._result(method, r)
+
+    @staticmethod
+    def _result(method: str, r) -> Any:
         try:
             data = r.json()
         except ValueError:
@@ -242,7 +259,7 @@ class Approvals:
                 reply_markup={"inline_keyboard": [[
                     {"text": "✅ Send", "callback_data": f"ok:{d.id}"},
                     {"text": "❌ Cancel", "callback_data": f"no:{d.id}"},
-                ]]},
+                ]] + ([[{"text": "👀 Files", "callback_data": f"pv:{d.id}"}]] if d.files else [])},
             )
         except Exception as e:
             self.drafts.pop(d.id, None)
@@ -360,8 +377,44 @@ class Approvals:
             d.finish("cancelled", "Declined by the owner.")
             await self._answer(q["id"], "Cancelled.")
             await self._update_card(d)
+        elif action == "pv":
+            if not d.files:
+                await self._answer(q["id"], "This draft has no files.")
+            elif d.id in self._previewing:
+                await self._answer(q["id"], "Already sending them…")
+            else:
+                self._previewing.add(d.id)
+                await self._answer(q["id"], "Sending you the files…")
+                asyncio.get_running_loop().create_task(self._preview(d))
         else:
             await self._answer(q["id"], "Unknown action.")
+
+    async def _preview(self, d: Draft) -> None:
+        """The draft's actual files, to the owner only, as documents (original bytes). The draft
+        itself does not change: ✅ and ❌ stay on its card."""
+        try:
+            n = len(d.files)
+            for i, f in enumerate(d.files, 1):
+                head = f"👀 Draft {d.id} · {i}/{n}"
+                found = self.preview_file(f["id"]) if self.preview_file else None
+                if found is None:
+                    await self.notify(f"{head}: {f['name']} is no longer on the server; approving the "
+                                      "draft would fail.", silent=True)
+                    continue
+                path, size, sha256, mime = found
+                if size > PREVIEW_MAX:
+                    await self.notify(f"{head}: {f['name']} · {f['size']} is too big to preview here (a bot "
+                                      f"may send up to 50 MB).\nsha256 {sha256}", silent=True)
+                    continue
+                try:
+                    await self.api_file("sendDocument", "document", path, f["name"], mime, chat_id=self.owner_id,
+                                        caption=head, disable_notification=True,
+                                        disable_content_type_detection=True)
+                except Exception as e:
+                    logger.warning("preview of %s failed: %s", f["id"], e)
+                    await self.notify(f"{head}: could not send {f['name']} ({e}).", silent=True)
+        finally:
+            self._previewing.discard(d.id)
 
     async def _reply(self, text: str) -> None:
         await self.notify(text)
