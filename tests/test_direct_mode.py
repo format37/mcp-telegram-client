@@ -25,7 +25,7 @@ def probe():
 
 def test_no_draft_tools(probe):
     assert set(probe["tools"]) == {"whoami", "list_dialogs", "find_peer", "read_history",
-                                   "search_chat", "get_media", "send_message"}
+                                   "search_chat", "get_media", "upload_link", "list_uploads", "send_message"}
 
 
 def test_agent_facing_text_has_no_approval_vocabulary(probe):

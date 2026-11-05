@@ -15,9 +15,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
+import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -506,6 +509,67 @@ async def send_text(client, entity, text: str, *, reply_to: int | None, plain: b
         raise Fail(f"Cannot write to {label(entity)}: {type(e).__name__}")
     log.record(pid, msg.id, is_new)
     return msg
+
+
+# ── outgoing files: what Telethon will make of a path ────────────────────────
+# Telethon sends a path as a photo only for .jpg/.jpeg/.png (utils.is_image), and
+# recognises audio and video by the mime type of the extension. Register every
+# extension named here, so that does not depend on the image's /etc/mime.types.
+PHOTO_EXT = (".jpg", ".jpeg", ".png")
+KIND_EXT = {**dict.fromkeys(PHOTO_EXT, "photo"),
+            **dict.fromkeys((".mp4", ".mov", ".webm", ".mkv"), "video"),
+            **dict.fromkeys((".mp3", ".m4a", ".ogg", ".flac", ".wav"), "audio"),
+            ".gif": "gif"}
+for _ext, _mime in ((".jpg", "image/jpeg"), (".jpeg", "image/jpeg"), (".png", "image/png"),
+                    (".gif", "image/gif"), (".webp", "image/webp"), (".heic", "image/heic"),
+                    (".mp4", "video/mp4"), (".mov", "video/quicktime"), (".webm", "video/webm"),
+                    (".mkv", "video/x-matroska"), (".mp3", "audio/mpeg"), (".m4a", "audio/mp4"),
+                    (".ogg", "audio/ogg"), (".flac", "audio/flac"), (".wav", "audio/x-wav")):
+    mimetypes.add_type(_mime, _ext)
+
+
+@dataclass
+class FileInfo:
+    mime: str
+    kind: str  # photo | video | audio | gif | document
+    width: int | None = None
+    height: int | None = None
+
+
+def image_size(path) -> tuple[int, int] | None:
+    """Width and height of a PNG or JPEG from its header alone, or None.
+
+    Never load(), verify(), convert() or thumbnail(): they decode pixels, and a
+    decompression bomb would take the container past its memory cap. Image.open
+    raises DecompressionBombError on a huge header and only warns on a large
+    one, so the warning is made an error here too; past either limit the file
+    is not an image as far as sending goes."""
+    try:
+        from PIL import Image
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path, formats=("PNG", "JPEG")) as im:
+                w, h = im.size
+        cap = Image.MAX_IMAGE_PIXELS or 89_478_485
+    except Exception:
+        return None
+    return (w, h) if 0 < w and 0 < h and w * h <= cap else None
+
+
+def probe(path, name: str | None = None) -> FileInfo:
+    """Kind and mime type from the extension of `name` (default: the path's basename);
+    for a photo, its size from the image header. A .jpg/.jpeg/.png whose header does not
+    read cleanly is a document, so nothing ever hands it to Telethon's photo resize."""
+    ext = os.path.splitext(name or os.path.basename(path))[1].lower()
+    mime = (mimetypes.guess_type("x" + ext)[0] if ext else None) or "application/octet-stream"
+    kind = KIND_EXT.get(ext, "document")
+    if kind == "photo":
+        dims = image_size(path)
+        if dims is None:
+            return FileInfo(mime, "document")
+        return FileInfo(mime, kind, *dims)
+    return FileInfo(mime, kind)
 
 
 # ── files ────────────────────────────────────────────────────────────────────

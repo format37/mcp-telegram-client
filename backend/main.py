@@ -25,6 +25,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -46,6 +47,7 @@ from starlette.responses import JSONResponse  # noqa: E402
 from starlette.routing import Mount, Route  # noqa: E402
 
 import tg  # noqa: E402
+import uploads  # noqa: E402
 from approvals import LOCKED_MSG, RULE, Approvals, Draft  # noqa: E402
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -94,9 +96,23 @@ MAX_DOC_CHARS = 60_000
 IMAGE_MAX_PX = 1600
 AUDIT_FILE = tg.DATA_DIR / "audit.jsonl"
 
+# Files for send_message: uploaded with curl to <PUBLIC_URL>/upload/<ticket>/<name> (uploads.py).
+MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "100")) * 1e6)
+UPLOAD_STORE_BYTES = int(float(os.getenv("UPLOAD_STORE_MB", "1000")) * 1e6)
+UPLOAD_TTL_S = 60 * float(os.getenv("UPLOAD_TTL_MIN", "120"))
+UPLOAD_LINK_TTL_S = 60 * float(os.getenv("UPLOAD_LINK_TTL_MIN", "15"))
+_public_host = next((h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()), "")
+PUBLIC_URL = (os.getenv("TGC_PUBLIC_URL", "").strip()
+              or (f"https://{_public_host}{BASE_PATH}" if _public_host else f"http://localhost:{PORT}{BASE_PATH}")
+              ).rstrip("/")
+UPLOAD_PREFIX = f"{BASE_PATH}/upload/"
+
 
 class _Redact(logging.Filter):
-    """Secrets ride in URLs (MCP path tokens, the Bot API path); keep them out of every log line."""
+    """Secrets ride in URLs (MCP path tokens, the Bot API path, upload tickets); keep them out of
+    every log line. Tickets are minted at runtime, so they go by position: /upload/<ticket>/."""
+
+    _TICKET = re.compile(r"(/upload/)[^/\s\"'?#]+")
 
     def __init__(self, secrets_: set[str]):
         super().__init__()
@@ -108,6 +124,8 @@ class _Redact(logging.Filter):
             red = msg
             for s in self._s:
                 red = red.replace(s, "***")
+            if "/upload/" in red:
+                red = self._TICKET.sub(r"\1***", red)
             if red != msg:
                 record.msg, record.args = red, ()
         except Exception:
@@ -130,6 +148,8 @@ logging.getLogger("mcp.server.streamable_http").addFilter(_StreamErrorFilter())
 # ── state ────────────────────────────────────────────────────────────────────
 policy = tg.Policy.from_env()
 sendlog = tg.SendLog()
+store = uploads.Store(tg.DATA_DIR / "uploads", ttl_s=UPLOAD_TTL_S, link_ttl_s=UPLOAD_LINK_TTL_S,
+                      max_file=MAX_UPLOAD_BYTES, max_total=UPLOAD_STORE_BYTES)
 approvals = Approvals(BOT_TOKEN, OWNER_ID, state_file=tg.DATA_DIR / "state.json", ttl_s=APPROVAL_TTL_S,
                       approval_mode=SEND_APPROVAL)
 
@@ -191,6 +211,7 @@ async def _status_text() -> str:
     else:
         lines.append("sends: direct, no approval (TGC_SEND_APPROVAL=false)")
     lines.append(sendlog.summary())
+    lines.append(store.summary())
     recent = _recent_audit()
     if recent:
         lines += ["", "recent tool calls:"] + recent
@@ -548,6 +569,47 @@ async def get_media(peer: str, message_ids: list[int]) -> list:
     return await _guarded("get_media", f"{peer} {ids}", run)
 
 
+@mcp.tool()
+async def upload_link() -> str:
+    """A short-lived URL for uploading files from your shell with curl, to attach them with
+    send_message(files=[...]). Returns the exact curl command, the limits and the expiry.
+    Uploading sends nothing to anyone."""
+    if approvals.locked:
+        _audit("upload_link", "-", "refused: locked")
+        raise ToolError(LOCKED_MSG)
+    t = store.new_ticket()
+    url = f"{PUBLIC_URL}/upload/{t.token}/"
+    _audit("upload_link", "-", "ok")
+    return (
+        f"Upload URL, valid until {uploads.iso(t.expires)} for up to {uploads.FILES_PER_TICKET} files "
+        f"of at most {uploads.human(MAX_UPLOAD_BYTES)} each:\n{url}\n\n"
+        "Upload from your shell. Keep the trailing '/': curl then appends the file's own name.\n"
+        f"  curl -sS -T /path/to/chart.png {url}\n"
+        f"  curl -sS -T \"{{/path/a.png,/path/b.pdf}}\" {url}   (several files)\n"
+        "Each upload prints one JSON line: id, name, size, sha256, kind (photo, video, audio, gif or "
+        "document).\nThen pass the ids: send_message(peer, text, files=[\"f_…\"]). An upload is not a "
+        "message: nothing reaches anyone until send_message.\n"
+        f"Uploads are kept {UPLOAD_TTL_S / 60:.0f} minutes; list_uploads() shows them. When integrity "
+        "matters, compare sha256 with `sha256sum <file>`.\n"
+        f"If curl reports a 403 from a proxy or a failed CONNECT, {urlsplit(PUBLIC_URL).hostname} is "
+        "missing from your sandbox's network allow-list: tell the owner, and do not retry in a loop.")
+
+
+@mcp.tool()
+async def list_uploads() -> str:
+    """Uploaded files that have not expired: id, kind, size, expiry, name, sha256. For when the
+    ids printed by the uploads are lost."""
+    if approvals.locked:
+        _audit("list_uploads", "-", "refused: locked")
+        raise ToolError(LOCKED_MSG)
+    rows = store.listing()
+    _audit("list_uploads", "-", f"{len(rows)} files")
+    if not rows:
+        return "No uploads. upload_link() gives a URL to upload files from your shell."
+    return "\n".join(f"{r.id}  {r.kind:<8} {uploads.human(r.size):>9}  until {uploads.iso(r.expires)}  "
+                     f"{r.name}  sha256 {r.sha256}" for r in rows)
+
+
 def _describe(d: Draft) -> str:
     if d.status == "sent":
         return f"✅ Sent {d.result} to {d.peer_label} — approved by the owner (draft {d.id})."
@@ -702,19 +764,31 @@ async def _watch_session() -> None:
         await asyncio.sleep(60)
 
 
+async def _sweep_uploads() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            store.sweep()
+        except Exception:
+            logger.exception("upload sweep failed")
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app):
     tg.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    store.load()
     await approvals.start()  # a bad bot token stops the server here, on purpose
     policy.blocked_ids.add(approvals.bot_id)
-    watcher = asyncio.create_task(_watch_session(), name="session-watch")
+    tasks = [asyncio.create_task(_watch_session(), name="session-watch"),
+             asyncio.create_task(_sweep_uploads(), name="upload-sweep")]
     try:
         async with mcp.session_manager.run():
             yield
     finally:
-        watcher.cancel()
-        with contextlib.suppress(BaseException):
-            await watcher
+        for t in tasks:
+            t.cancel()
+            with contextlib.suppress(BaseException):
+                await t
         await approvals.stop()
         await account.close()
 
@@ -723,6 +797,9 @@ mcp_asgi = mcp.streamable_http_app()
 routes = [
     Route("/health", health, methods=["GET"]),
     Route(f"{BASE_PATH}/health", health, methods=["GET"]),
+    # No MCP token here (see TokenAuthMiddleware): the ticket in the path is the credential, and
+    # the endpoint answers every method under the prefix itself.
+    Route(UPLOAD_PREFIX + uploads.REST, uploads.Endpoint(store, locked=lambda: approvals.locked)),
     Mount("/", app=mcp_asgi),  # LAST: it matches every path
 ]
 app = Starlette(routes=routes, lifespan=lifespan)
@@ -734,11 +811,14 @@ def _token_ok(candidate: str | None) -> bool:
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
     """Bearer header, ?token= or /telegram-client/<token>/ (a claude.ai/Duet connector can only
-    carry the secret in the URL). Only /health is public. There is no "auth off" mode."""
+    carry the secret in the URL). Only /health is public, and /telegram-client/upload/..., where
+    the upload ticket in the path is the credential. There is no "auth off" mode."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path or "/"
         if path in ("/health", f"{BASE_PATH}/health") or not path.startswith(BASE_PATH):
+            return await call_next(request)
+        if request.scope.get("path", "").startswith(UPLOAD_PREFIX):  # the path the router matches
             return await call_next(request)
         auth = request.headers.get("authorization") or ""
         if auth.lower().startswith("bearer ") and _token_ok(auth.split(" ", 1)[1].strip()):

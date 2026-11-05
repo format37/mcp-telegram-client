@@ -87,7 +87,7 @@ def test_mcp_round_trip_without_a_session(live):
 
     tools = {t["name"] for t in _rpc(c, "tools/list", sid=sid, id_=2).json()["result"]["tools"]}
     assert tools == {"whoami", "list_dialogs", "find_peer", "read_history", "search_chat",
-                     "get_media", "send_message", "send_status", "cancel_send"}
+                     "get_media", "upload_link", "list_uploads", "send_message", "send_status", "cancel_send"}
 
     res = _rpc(c, "tools/call", {"name": "read_history", "arguments": {"peer": "@ivan"}}, sid=sid, id_=3).json()["result"]
     assert res["isError"] and "not logged in" in json.dumps(res)
