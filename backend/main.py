@@ -12,7 +12,8 @@ text (instructions, tool descriptions) describes only the active mode.
 
 Never exposed: login, logout, session management, deleting or editing
 messages, Telegram's service chat (login codes), the approval bot's chat and,
-by default, Saved Messages.
+by default, Saved Messages. TGC_SEND_TO_SAVED_MESSAGES opens Saved Messages for
+sending only: they still cannot be read, searched or listed.
 """
 from __future__ import annotations
 
@@ -342,9 +343,16 @@ silent (no read receipts). Transcript lines are `#<id> [date] <who>: <text>`; `m
 owner, `↩#id` a reply, `[fwd from …]` a forward; media appear as tags like `[photo]` or
 `[file brief.pdf 2.1MB]`. Look at photos and screenshots with get_media(peer, [ids]) — that
 is often where the real requirements are — and read text/PDF documents the same way.
-Voice notes are not transcribed: say so. Telegram's service chat, this server's control
-bot and (by default) Saved Messages are never accessible.
+Voice notes are not transcribed: say so. Telegram's service chat and this server's control
+bot are never accessible.
 """
+if policy.allow_saved:
+    _READING += 'Saved Messages, the owner\'s own chat, are peer "me".\n'
+elif policy.send_saved:
+    _READING += ('Saved Messages, the owner\'s own chat, are send-only: send_message(peer="me") puts text or\n'
+                 "files there, but they can never be read, searched or listed.\n")
+else:
+    _READING += "Neither are Saved Messages, the owner's own chat.\n"
 
 _SENDING_APPROVAL = """
 Sending: send_message never sends by itself. It creates a draft and the owner gets a card
@@ -797,9 +805,11 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
                         "Shorten it, or split it into separate messages.")
 
     async def prepare(client):
-        entity = await tg.resolve_peer(client, peer, policy)
-        prior = await client.get_messages(entity, limit=1)
-        is_new = len(prior) == 0 and tg.kind_of(entity) in ("user", "bot")
+        entity = await tg.resolve_peer(client, peer, policy, write=True)
+        is_new = False
+        if tg.kind_of(entity) != "me":  # Saved Messages are never read, not even their last message
+            prior = await client.get_messages(entity, limit=1)
+            is_new = len(prior) == 0 and tg.kind_of(entity) in ("user", "bot")
         if is_new and not allow_new:
             raise tg.Fail(f"No prior conversation with {tg.label(entity)}. A first message to a stranger "
                           "needs allow_new=true, and only when the owner explicitly asked to contact them.")
@@ -815,7 +825,7 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
             return entity, first, batches
 
         entity, first, batches = await _guarded("send_message", peer, run_direct, read=False, audit_ok=False)
-        lbl, sent = tg.label(entity), _delivered(first, batches)
+        lbl, sent = tg.chat_label(entity), _delivered(first, batches)
         _audit("send_message", lbl, f"sent {sent}")
         if NOTIFY_SENDS:
             line = f"📤 Sent as you → {lbl} · {sent}"
@@ -829,7 +839,7 @@ async def send_message(peer: str, text: str = "", files: list[str] = [], as_file
 
     async def run(client):
         entity, is_new = await prepare(client)
-        d = Draft(peer_label=tg.label(entity), peer_id=tg.peer_id(entity), text=body,
+        d = Draft(peer_label=tg.chat_label(entity), peer_id=tg.peer_id(entity), text=body,
                   reply_to=reply_to or None, plain=plain, silent=silent, no_preview=no_preview,
                   is_new=is_new, entity=entity, files=rows, as_file=as_file, album=album,
                   text_first=text_first, grouping=grouping)

@@ -36,7 +36,7 @@ async def probe():
     async def fake_client():
         return FakeClient()
 
-    async def fake_resolve(client, spec, policy):
+    async def fake_resolve(client, spec, policy, **kw):
         policy.check(ivan)
         return ivan
 

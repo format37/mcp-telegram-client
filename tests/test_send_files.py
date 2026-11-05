@@ -363,7 +363,7 @@ def wired(monkeypatch, tmp_path):
     async def fake_client():
         return c
 
-    async def fake_resolve(client, spec, policy):
+    async def fake_resolve(client, spec, policy, **kw):
         return IVAN
 
     async def fake_text(client, entity, text, **kw):
@@ -583,3 +583,43 @@ def test_a_gif_gets_its_size_from_the_header_and_a_fake_one_is_a_file(tmp_path, 
     c = FakeClient()
     send(c, [fake], log)
     assert c.calls[0][1]["force_document"] is True and "attributes" not in c.calls[0][1]
+
+
+# ── Saved Messages: send-only ────────────────────────────────────────────────
+REAL_RESOLVE = tg.resolve_peer
+
+
+def test_saved_messages_take_sends_but_are_never_read(wired, monkeypatch):
+    me = T.User(id=OWNER, first_name="Alex", username="format37", is_self=True)
+
+    async def get_me():
+        return me
+
+    async def never(*a, **kw):
+        raise AssertionError("Saved Messages must never be read")
+
+    wired.client.get_me = get_me
+    wired.client.get_messages = never
+    wired.client.iter_messages = never
+    monkeypatch.setattr(main.tg, "resolve_peer", REAL_RESOLVE)
+    monkeypatch.setattr(main, "policy", tg.Policy(send_saved=True))
+    rec = upload("note.pdf")
+    _, d = asyncio.run(submit("me", "Note to self", files=[rec.id]))
+    assert d.peer_label == f"Saved Messages (id {OWNER})" and d.is_new is False
+    assert "Send as you → Saved Messages" in wired.bot.sent("sendMessage")[-1]["text"]
+    for call in (lambda: main.read_history("me"), lambda: main.search_chat("me", "password"),
+                 lambda: main.get_media("me", [1])):
+        with pytest.raises(ToolError, match="send-only"):
+            asyncio.run(call())
+
+
+def test_text_to_saved_messages_skips_typing(log):
+    me = T.User(id=OWNER, first_name="Alex", is_self=True)
+
+    class Client:  # no .action(): calling it would fail the test
+        async def send_message(self, entity, text, **kw):
+            return SimpleNamespace(id=7, date=datetime.now(timezone.utc))
+
+    msg = asyncio.run(tg.send_text(Client(), me, "x" * 200, reply_to=None, plain=False, silent=False,
+                                   no_preview=False, log=log, is_new=False))
+    assert msg.id == 7 and log.status()["hour"] == 1

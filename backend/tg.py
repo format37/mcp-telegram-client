@@ -107,34 +107,50 @@ def label(ent) -> str:
     return f"{name_of(ent)} ({'@' + u + ', ' if u else ''}{kind_of(ent)}, id {peer_id(ent)})"
 
 
+def chat_label(ent) -> str:
+    """label(), except that the owner's own chat reads as what it is to him."""
+    return f"Saved Messages (id {peer_id(ent)})" if kind_of(ent) == "me" else label(ent)
+
+
 def ts(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-class Policy:
-    """Which chats the server refuses to touch, for reading AND writing."""
+SAVED_WRITE_ONLY = ('Saved Messages are send-only on this server: send_message(peer="me") puts text or files '
+                    "there, but they can never be read, searched or listed.")
 
-    def __init__(self, *, allow_saved: bool = False, deny: set[int] | None = None):
+
+class Policy:
+    """Which chats the server refuses to touch. Every rule holds for reading and writing alike,
+    except Saved Messages: many people keep secrets there (the owner keeps passwords), so they
+    can be opened for sending only (send_saved), or for reading too (allow_saved)."""
+
+    def __init__(self, *, allow_saved: bool = False, send_saved: bool = False, deny: set[int] | None = None):
         self.allow_saved = allow_saved
+        self.send_saved = send_saved or allow_saved
         self.deny = set(deny or ())
         self.blocked_ids: set[int] = set()  # filled at startup with the approval bot's id
 
     @classmethod
     def from_env(cls) -> "Policy":
-        return cls(allow_saved=env_bool("TGC_ALLOW_SAVED_MESSAGES"), deny=env_ids("TGC_DENY_PEERS"))
+        return cls(allow_saved=env_bool("TGC_ALLOW_SAVED_MESSAGES"), send_saved=env_bool("TGC_SEND_TO_SAVED_MESSAGES"),
+                   deny=env_ids("TGC_DENY_PEERS"))
 
-    def check(self, ent) -> None:
+    def check(self, ent, *, write: bool = False) -> None:
+        """Raise Fail unless `ent` may be read, or with write=True sent to."""
         raw = getattr(ent, "id", None)
         if raw in SERVICE_IDS:
             raise Fail("That is Telegram's service chat (login codes); it is never accessible through this server.")
         if raw in self.blocked_ids:
             raise Fail("That is this server's control bot; its chat is not accessible through this server.")
-        if isinstance(ent, T.User) and ent.is_self and not self.allow_saved:
-            raise Fail("Saved Messages are off limits on this server (TGC_ALLOW_SAVED_MESSAGES is off).")
+        if isinstance(ent, T.User) and ent.is_self and not self.allow_saved and not (write and self.send_saved):
+            raise Fail(SAVED_WRITE_ONLY if self.send_saved else
+                       "Saved Messages are off limits on this server (TGC_ALLOW_SAVED_MESSAGES is off).")
         if raw in self.deny or peer_id(ent) in self.deny:
             raise Fail("The owner has blocked this chat for this server (TGC_DENY_PEERS).")
 
     def visible(self, ent) -> bool:
+        """May it be shown in a listing (list_dialogs, find_peer, name lookup): the read rules."""
         try:
             self.check(ent)
             return True
@@ -142,8 +158,9 @@ class Policy:
             return False
 
 
-async def resolve_peer(client: TelegramClient, spec: str, policy: Policy):
-    """Resolve and policy-check a peer: @username, t.me link, phone, numeric id, 'me', or part of a name."""
+async def resolve_peer(client: TelegramClient, spec: str, policy: Policy, *, write: bool = False):
+    """Resolve and policy-check a peer: @username, t.me link, phone, numeric id, 'me', or part of a
+    name. write=True checks it for sending, not reading (the two differ for Saved Messages)."""
     s = (spec or "").strip()
     if not s:
         raise Fail("peer is empty")
@@ -184,7 +201,7 @@ async def resolve_peer(client: TelegramClient, spec: str, policy: Policy):
             raise Fail(f"'{spec}' is ambiguous:\n" + "\n".join(f"  {label(e)}" for e in hits[:15])
                        + "\nUse the id or @username.")
         ent = hits[0]
-    policy.check(ent)
+    policy.check(ent, write=write)
     return ent
 
 
@@ -510,8 +527,9 @@ async def send_text(client, entity, text: str, *, reply_to: int | None, plain: b
     pid = peer_id(entity)
     try:
         await log.pace()
-        async with client.action(entity, "typing"):
-            await asyncio.sleep(min(1.0 + len(text) / 30, 6.0))
+        if kind_of(entity) != "me":  # nobody watches 'typing…' in Saved Messages
+            async with client.action(entity, "typing"):
+                await asyncio.sleep(min(1.0 + len(text) / 30, 6.0))
         msg = await client.send_message(entity, text, reply_to=reply_to or None,
                                         parse_mode=None if plain else "md", silent=silent,
                                         link_preview=not no_preview)

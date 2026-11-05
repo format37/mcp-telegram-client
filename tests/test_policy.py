@@ -72,3 +72,34 @@ def test_write_private_is_0600(tmp_path):
     f = tmp_path / "x" / "session.string"
     tg.write_private(f, "secret")
     assert f.read_text() == "secret" and f.stat().st_mode & 0o777 == 0o600
+
+
+def test_saved_messages_can_be_send_only():
+    me = user(4242, is_self=True)
+    p = tg.Policy(send_saved=True)
+    p.check(me, write=True)
+    with pytest.raises(tg.Fail, match="send-only"):
+        p.check(me)  # reading
+    assert not p.visible(me)  # and never listed
+    full = tg.Policy(allow_saved=True)
+    full.check(me)
+    full.check(me, write=True)
+    with pytest.raises(tg.Fail, match="off limits"):
+        tg.Policy().check(me, write=True)
+    with pytest.raises(tg.Fail, match="service chat"):  # the other rules hold for writing too
+        tg.Policy(send_saved=True).check(user(777000), write=True)
+
+
+def test_resolve_peer_me_is_checked_for_what_it_is_used_for():
+    import asyncio
+
+    me = user(4242, is_self=True)
+
+    class Client:
+        async def get_me(self):
+            return me
+
+    p = tg.Policy(send_saved=True)
+    assert asyncio.run(tg.resolve_peer(Client(), "me", p, write=True)) is me
+    with pytest.raises(tg.Fail, match="send-only"):
+        asyncio.run(tg.resolve_peer(Client(), "me", p))
