@@ -1,8 +1,9 @@
 # Kickoff: file attachments for `send_message`
 
-Status: design agreed on 2026-11-05 between the owner and Claude. Not started.
-This is the brief for the implementing session. Everything under "Decisions" is
-settled unless the owner edits it here first.
+Status: design agreed on 2026-11-05 between the owner and Claude, revised the
+same day after Duet's review (issue #1). Not started. This is the brief for the
+implementing session. Everything under "Decisions" is settled unless the owner
+edits it here first.
 
 ## Goal
 
@@ -52,6 +53,21 @@ with the raw file as the body. `POST` is accepted with the same meaning.
   `curl -sS -T /path/to/file <url>/`. curl appends the local basename when the
   URL ends with `/`, and `curl -sS -T "{a.png,b.png}" <url>/` uploads several.
   `curl --data-binary @file <url>/<name>` works as well.
+- Filenames arrive percent-encoded and must be decoded exactly once. Checked on
+  2026-11-05 with curl 8.5 against uvicorn and Starlette:
+
+  | local file | request path from curl | Starlette path param |
+  |---|---|---|
+  | `my chart.png` | `my%20chart.png` | `my chart.png` |
+  | `отчёт.pdf` | `%d0%be%d1%82%d1%87%d1%91%d1%82.pdf` | `отчёт.pdf` |
+  | `a%41#b.txt` | `a%2541%23b.txt` | `a%41#b.txt` |
+
+  uvicorn already decodes the path, so the handler takes the path param as is
+  and never calls `unquote` again: a second decode turns `a%41` into `aA`.
+  Declare the route as `/upload/{ticket}/{name:path}` so a decoded `%2F` does
+  not break routing, then keep only the last `/` segment. Normalise the name
+  to Unicode NFC, because macOS hands curl decomposed Cyrillic (`е` plus a
+  combining diaeresis instead of `ё`).
 - Response `201` with JSON:
   `{"id":"f_3fa9c21b7d04","name":"chart.png","size":123456,"sha256":"...",
   "mime":"image/png","kind":"photo","width":1600,"height":900,
@@ -79,23 +95,56 @@ with the raw file as the body. `POST` is accepted with the same meaning.
 - Redaction: the ticket sits in the request path, and uvicorn's access log
   prints paths. Extend `_Redact` with a regex pass that turns
   `/upload/<anything>/` into `/upload/***/`, since tickets are dynamic. Test it.
+- Caddy, checked on 2026-11-05: the VPS runs Caddy 2.8.4, and its Caddyfile has
+  no `log` directive on any site, in line with the house "no access log" rule.
+  So Caddy writes no access log for uploads today. Keep it that way. If a `log`
+  directive is ever added to the `mcp.latentstate.dev` block, add
+  `log_skip /telegram-client/upload/*` with it.
+- Residual, accepted: Caddy's error logger still records the request URI in
+  the `reverse-proxy` container's output when a proxied request fails, for
+  example a 502 while this container restarts. A leaked ticket allows uploads
+  only, never sends, within the store caps, until it expires.
+- The `upload_link` result also tells the agent what a sandbox block looks like.
+  If curl reports a 403 from a proxy or a failed CONNECT, the upload host is
+  missing from the sandbox's network allow-list. The agent tells the owner and
+  does not retry in a loop.
 
 ### Storage: `backend/uploads.py`
 
-- Bytes go to `DATA_DIR/uploads/<id>` (0600, written under a temp name and
-  moved into place like `write_private`), metadata to `<id>.json` beside it. On
-  startup rebuild the index from the sidecars and sweep.
+- Bytes go to `DATA_DIR/uploads/<id>/<name>` (0600, written under a temp name
+  and moved into place like `write_private`), metadata to
+  `DATA_DIR/uploads/<id>.json`. On startup rebuild the index from the sidecars
+  and sweep.
+- The stored path must end with the sanitised original name. Telethon decides
+  photo or document from the path's extension, guesses the mime type from it,
+  and shows the recipient the path's basename as the filename. A bare
+  `uploads/<id>` would go out as an extensionless document named after the id.
 - `id` is `"f_" + secrets.token_hex(6)`. `sha256` is computed while streaming.
 - Lifetime `UPLOAD_TTL_MIN` (default 120). A sent file is not deleted: the
   agent may send the same chart to two people. It expires. A file referenced
   by a pending draft gets its expiry pushed past the draft's expiry at submit.
 - Caps: `MAX_UPLOAD_MB` per file (default 100), `UPLOAD_STORE_MB` in total
   (default 1000). A sweep task started in `lifespan` runs every 60 s.
-- `kind` comes from the extension and mime type (`mimetypes`); images are
-  verified with Pillow and their dimensions recorded. Kinds: `photo`
-  (jpeg, png, webp), `video` (mp4, mov, webm, mkv), `audio` (mp3, m4a, ogg,
-  flac, wav), `gif`, else `document`. The filename is reduced to a basename,
-  control characters stripped, 200 bytes at most, and never used as a path.
+- `kind` comes from the extension and mime type (`mimetypes`). Kinds: `photo`
+  (jpeg, png), `video` (mp4, mov, webm, mkv), `audio` (mp3, m4a, ogg, flac,
+  wav), `gif`, else `document`. Photos are only jpeg and png because Telethon
+  sends only those extensions as photos. Other images, such as webp, heic and
+  bmp, are documents and always go with `force_document=True`, since a webp
+  sent without it can turn into a sticker.
+- Image dimensions come from the header only: `Image.open(path)` and read
+  `.size`. Never call `load()`, `verify()`, `convert()` or `thumbnail()`, which
+  decode pixels; a decompression bomb would push the container past its
+  512 MB memory cap. `Image.open` itself raises `DecompressionBombError` on a
+  huge header and only warns on a large one, so open it with
+  `DecompressionBombWarning` turned into an error. Any failure means `document`
+  with no dimensions.
+- The header check also guards the send. Telethon decodes and resizes images it
+  sends as photos once they exceed 2560 px. Only images that passed the photo
+  limits below reach that path, which bounds the decode at about 5000 x 5000.
+- The filename is reduced to a basename, control characters stripped,
+  normalised to NFC, cut to 200 bytes of UTF-8 at a character boundary with the
+  extension kept, and never used as a path on its own. A Cyrillic name is two
+  bytes per letter, so the cut matters at about 100 letters.
 - `list_uploads()` tool: id, name, size, sha256, kind, expiry. It exists for
   recovery when the agent lost its shell output. `/status` in the bot and
   `_status_text` get a line `uploads: N files, X MB`.
@@ -115,23 +164,36 @@ Rules:
 
 - `text` may be empty when `files` is non-empty. Otherwise it is an error, as
   today.
-- Caption: when `ulen(text) <= CAPTION_MAX` (env, default 1024; the owner has
-  Premium and may raise it) the text is the caption of the album, or of the
-  first file when `album=False`. Otherwise the text goes out first as its own
-  message (markdown, `reply_to`, as today) and the files follow it with no
-  caption. The result says which happened.
-- "As media" (`as_file=False`): images go as photos (Telegram recompresses)
-  when the file is at most 10 MB, width plus height is at most 10000 px and
-  the aspect ratio is at most 20:1; otherwise they go as documents with a note
-  in the result and on the card. Videos go as video with
-  `supports_streaming=True`, audio as audio, gif as animation, everything else
-  as a document. `as_file=True` sets `force_document=True` for all.
+- Caption: the text is the caption of the album, or of the first file when
+  `album=False`, when its parsed length fits `CAPTION_MAX` (env, default 1024;
+  the owner has Premium and may raise it). Otherwise the text goes out first as
+  its own message (markdown, `reply_to`, as today) and the files follow it with
+  no caption. The result says which happened.
+- Parsed length means `tg.ulen` of the text Telegram will store, after the
+  markdown markup is removed: `telethon.extensions.markdown.parse(text)[0]`,
+  or the raw text when `plain=True`. Markup can be most of the raw length. A
+  sample with bold, italic, code and one link measured 77 characters raw and
+  28 parsed. The card limit `MAX_DRAFT_CHARS` still applies to the raw text,
+  because the card shows it raw.
+- "As media" (`as_file=False`): files of kind `photo` go as photos (Telegram
+  recompresses) when the file is at most 10 MB, its header gave dimensions,
+  width plus height is at most 10000 px and the aspect ratio is at most 20:1;
+  otherwise they go as documents with a note in the result and on the card.
+  Videos go as video with `supports_streaming=True`, audio as audio, gif as
+  animation, everything else as a document. `as_file=True` sets
+  `force_document=True` for all.
 - Album grouping: Telegram allows photos and videos together, audio only with
   audio, documents only with documents. `album=True` over a set that mixes
   photo or video with document or audio raises a `ToolError` that names both
   fixes: `as_file=true` makes one document album, or `album=false`. More than
   10 files are split into consecutive albums of at most 10, caption on the
   first.
+- GIFs never go into an album. Telegram does not group animations, and
+  Telethon's `send_file` documentation says so. With `album=True`, a gif in a
+  set of two or more files raises the same `ToolError`, whether the others are
+  photos, videos or more gifs. A gif alone goes out as one animation. With
+  `as_file=True` a gif is a document and groups with documents; confirm on the
+  real account in step 5 that Telegram keeps it a file inside the album.
 - Budget: an album is one send. `album=False` with N files is N sends:
   `sendlog.check(N, ...)` up front, `pace()` between messages. A
   `FloodWaitError` midway pauses sends as in `send_text`; the error says how
@@ -186,16 +248,23 @@ Rules:
 
 ### Infrastructure
 
-- Caddy (the `ovh` skill): check the Caddyfile for a `request_body max_size`
-  under the MCP site (Caddy's default is unlimited) and for proxy timeouts.
-  After deploy, test a 1 MB and a roughly 100 MB upload end to end.
+- Caddy (the `ovh` skill), checked on 2026-11-05: the `mcp.latentstate.dev`
+  block has no `request_body max_size`, so Caddy's default of unlimited applies
+  and `MAX_UPLOAD_MB` in the app is the only cap. No Caddy change is needed.
+  The access log decision is under "Tickets".
+- Agent sandboxes: Claude cloud sessions such as Duet reach the internet
+  through an allow-listing proxy. The host in `TGC_PUBLIC_URL` must be on the
+  environment's network allow-list before an agent there can upload. The owner
+  added `*.latentstate.dev`, which covers `mcp.latentstate.dev`; it does not
+  cover the bare `latentstate.dev`, and nothing here needs that.
 - No compose change: uploads live in the `tgc-data` volume. `mem_limit` stays;
   streaming keeps memory flat, and Telethon uploads from a path in parts.
 - `.env.example` gains `TGC_PUBLIC_URL`, `MAX_UPLOAD_MB`, `UPLOAD_STORE_MB`,
   `UPLOAD_TTL_MIN`, `UPLOAD_LINK_TTL_MIN` and `CAPTION_MAX`, commented like
   the existing entries.
-- README gets a "Files" section with the three-step flow and the curl line.
-  Bump `APP_VERSION` in `tg.py` to `tgc-mcp 1.1`.
+- README gets a "Files" section with the three-step flow and the curl line,
+  and a prerequisite line: agents in sandboxes with an egress allow-list need
+  the upload host on that list. Bump `APP_VERSION` in `tg.py` to `tgc-mcp 1.1`.
 
 ## Tests
 
@@ -209,6 +278,14 @@ like the `live` fixture in `test_server.py`:
 - `sha256` and `size` match the bytes; the sidecar is 0600; a restart reloads
   the index; the sweep removes expired files and sidecars
 - filename sanitation: `../x`, control characters, a 300-byte name
+- real names survive the trip: requests to the encoded paths in the table under
+  "Upload endpoint" store `my chart.png`, `отчёт.pdf` and `a%41#b.txt`, never
+  a `%D0%BE...` form; a decomposed `отчёт.pdf` is stored in NFC; a 300-byte
+  Cyrillic name is cut at a character boundary and keeps `.pdf`
+- the stored file sits at `uploads/<id>/<name>`, so the path keeps the real
+  extension
+- a PNG whose header claims 100000 x 100000 pixels is stored as a `document`
+  with no dimensions, without decoding, and memory stays flat
 - the ticket is redacted from log records
 - `list_uploads` shows the file; `upload_link` refuses while locked
 
@@ -219,6 +296,15 @@ calls the way `_direct_probe.py` fakes `send_text`:
   the first, budget counted as 2
 - a photo plus a PDF with `album=True` raises the error naming `as_file` and
   `album=false`; with `as_file=True` it becomes one document album
+- a photo plus a gif, and two gifs, with `album=True` raise the same error; a
+  gif alone goes as one animation; a photo plus a gif with `as_file=True` is
+  one document album
+- the fake client receives paths that end with the original names, such as
+  `.../my chart.png`
+- a markdown-heavy text whose raw length is over `CAPTION_MAX` but whose
+  parsed length fits becomes the caption; one whose parsed length is over goes
+  out as its own message; with `plain=True` the raw length counts
+- a webp goes as a document even with `as_file=False`
 - `album=False` gives N calls, N budget, pacing between them
 - long text goes out as a message first and the files follow without a
   caption; short text becomes the caption
@@ -242,8 +328,18 @@ keep every existing test green.
    tests.
 4. Agent text, README, `.env.example`, version bump.
 5. Deploy on the VPS (`docker compose up -d --build`, see README) and test end
-   to end through Caddy against a chat the owner names. Saved Messages stay
-   blocked unless `TGC_ALLOW_SAVED_MESSAGES=true`.
+   to end against a chat the owner names. Saved Messages stay blocked unless
+   `TGC_ALLOW_SAVED_MESSAGES=true`. Prerequisite: the upload host is on the
+   Duet environment's network allow-list (see "Infrastructure").
+   - From Claude Code on the owner's machine, through Caddy only: upload a
+     1 MB and a roughly 100 MB file.
+   - From a Duet cloud session, through its sandbox proxy as well: the same two
+     sizes. That proxy's request body limit is unknown. If it cuts uploads
+     short, record the limit in the README and in the `upload_link` text.
+   - With real curl: `my chart.png` and `отчёт.pdf` show their real names on
+     the card and in the chat.
+   - On the real account: a photo plus a gif with `as_file=True` arrives as one
+     document album, the gif kept as a file.
 6. The preview button, if it was not done in step 3.
 
 Small commits on `main`, as before.
@@ -258,5 +354,7 @@ Small commits on `main`, as before.
   return as links.
 - Voice notes (`voice_note=True`) and video thumbnails (needs ffmpeg in the
   image).
+- The same decompression-bomb guard for `get_media`. Its `_to_jpeg` decodes
+  images from any chat, and anyone can post an image file there.
 - The same feature in the local `telegram-client` skill. `tgc.py` already runs
   on the owner's machine, so there it would just take paths.
