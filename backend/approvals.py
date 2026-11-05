@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -64,6 +65,12 @@ class Draft:
     no_preview: bool = False
     is_new: bool = False
     entity: Any = field(default=None, repr=False)
+    # Attachments, resolved at submit; the executor looks the files up again by id.
+    files: list[dict] = field(default_factory=list)  # [{id, name, size (text), how}] as the card lists them
+    as_file: bool = False
+    album: bool = True
+    text_first: bool = False  # the text goes out as its own message before the files
+    grouping: str = ""        # the card's line under the files, e.g. "album of 3 · the text as its caption"
     id: str = field(default_factory=lambda: secrets.token_hex(4))
     created: float = field(default_factory=time.time)
     expires: float = 0.0
@@ -81,6 +88,22 @@ def _hhmm(t: float) -> str:
     return datetime.fromtimestamp(t, timezone.utc).astimezone().strftime("%H:%M")
 
 
+def short_name(name: str, n: int = 64) -> str:
+    """A file name cut to fit a card line, extension kept (the files themselves carry it whole)."""
+    if len(name) <= n:
+        return name
+    stem, ext = os.path.splitext(name)
+    if 0 < len(ext) <= 12:
+        return stem[: n - len(ext) - 1] + "…" + ext
+    return name[: n - 1] + "…"
+
+
+def files_block(files: list[dict], grouping: str) -> str:
+    """One 📎 line per file, then how they go out."""
+    lines = [f"📎 {short_name(f['name'])} · {f['size']} · {f['how']}" for f in files]
+    return "\n".join(lines + ([grouping] if grouping else []))
+
+
 def card_text(d: Draft) -> str:
     flags = []
     if d.reply_to:
@@ -93,7 +116,12 @@ def card_text(d: Draft) -> str:
     lines = [f"✉️ Send as you → {d.peer_label}", " · ".join(flags)]
     if d.is_new:
         lines.append("⚠️ First message to this person — there is no prior chat.")
-    lines += [RULE, d.text, RULE, f"Draft {d.id} · expires {_hhmm(d.expires)}"]
+    lines.append(RULE)
+    if d.text or not d.files:
+        lines += [d.text, RULE]
+    if d.files:
+        lines.append(files_block(d.files, d.grouping))
+    lines.append(f"Draft {d.id} · expires {_hhmm(d.expires)}")
     return "\n".join(lines)
 
 

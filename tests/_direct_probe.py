@@ -23,11 +23,15 @@ async def probe():
     }
 
     ivan = T.User(id=5, first_name="Ivan", username="ivan")
-    sent, notes = [], []
+    sent, notes, file_sends = [], [], []
 
     class FakeClient:
         async def get_messages(self, entity, limit=1):
             return [object()]  # a prior conversation exists
+
+        async def send_file(self, entity, file, **kw):
+            file_sends.append([os.path.basename(file), kw.get("caption"), kw.get("force_document")])
+            return SimpleNamespace(id=78, date=datetime.now(timezone.utc))
 
     async def fake_client():
         return FakeClient()
@@ -53,7 +57,21 @@ async def probe():
     await asyncio.sleep(0.05)  # let the background log line go out
     out["sent"] = sent
     out["drafts"] = len(main.approvals.drafts)
-    out["notes"] = notes
+    out["notes"] = list(notes)
+
+    # a file, through the real upload store and tg.send_files
+    notes.clear()
+    main.sendlog.min_interval = 0
+    out["upload_link"] = await main.upload_link()
+
+    async def body():
+        yield b"%PDF-1.4 the report"
+
+    rec = await main.store.receive(main.store.new_ticket(), "отчёт за май.pdf", body())
+    out["file_result"] = await main.send_message("@ivan", "Отчёт за май", files=[rec.id])
+    await asyncio.sleep(0.05)
+    out["file_sends"] = file_sends
+    out["file_notes"] = notes
 
     main.approvals.locked = True
     try:

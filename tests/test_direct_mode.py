@@ -29,7 +29,8 @@ def test_no_draft_tools(probe):
 
 
 def test_agent_facing_text_has_no_approval_vocabulary(probe):
-    texts = {"instructions": probe["instructions"], **probe["tools"]}
+    texts = {"instructions": probe["instructions"], **probe["tools"], "result": probe["result"],
+             "file_result": probe["file_result"], "upload_link": probe["upload_link"]}
     for where, text in texts.items():
         low = (text or "").lower()
         for word in APPROVAL_VOCAB:
@@ -52,3 +53,12 @@ def test_owner_gets_a_silent_log_line(probe):
 def test_lock_still_stops_sends(probe):
     assert "locked" in probe["locked"].lower()
     assert probe["sent_after_lock"] == 1
+
+
+def test_a_file_goes_out_at_once_and_the_log_line_names_it(probe):
+    assert probe["file_result"].startswith("✅ Sent #78 to Ivan")
+    assert "(1 file · the text as its caption)" in probe["file_result"]
+    assert probe["file_sends"] == [["отчёт за май.pdf", "Отчёт за май", True]]
+    (note,) = probe["file_notes"]
+    assert note.get("silent") is True
+    assert "Отчёт за май" in note["text"] and "📎 отчёт за май.pdf" in note["text"]

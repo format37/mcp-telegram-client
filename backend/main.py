@@ -48,7 +48,7 @@ from starlette.routing import Mount, Route  # noqa: E402
 
 import tg  # noqa: E402
 import uploads  # noqa: E402
-from approvals import LOCKED_MSG, RULE, Approvals, Draft  # noqa: E402
+from approvals import LOCKED_MSG, RULE, Approvals, Draft, files_block  # noqa: E402
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -106,6 +106,8 @@ PUBLIC_URL = (os.getenv("TGC_PUBLIC_URL", "").strip()
               or (f"https://{_public_host}{BASE_PATH}" if _public_host else f"http://localhost:{PORT}{BASE_PATH}")
               ).rstrip("/")
 UPLOAD_PREFIX = f"{BASE_PATH}/upload/"
+CAPTION_MAX = int(os.getenv("CAPTION_MAX", "1024"))  # Telegram's caption limit; 4096 with Premium
+MAX_FILES_PER_SEND = 20                              # also bounds the file list on the approval card
 
 
 class _Redact(logging.Filter):
@@ -221,20 +223,99 @@ async def _status_text() -> str:
 approvals.status_fn = _status_text
 
 
+# ── sending text and files (both modes) ──────────────────────────────────────
+_HOW = {"photo": "photo (compressed)", "video": "video", "audio": "audio", "animation": "GIF", "document": "file"}
+
+
+def _plan(recs: list[uploads.Upload], as_file: bool, album: bool) -> tg.FilePlan:
+    return tg.plan_files([(r.name, r.size, tg.FileInfo(r.mime, r.kind, r.width, r.height)) for r in recs],
+                         as_file=as_file, album=album)
+
+
+def _file_rows(recs: list[uploads.Upload], plan: tg.FilePlan) -> list[dict]:
+    """Each file as the card and the send log show it: how it will go out."""
+    return [{"id": r.id, "name": r.name, "size": uploads.human(r.size),
+             "how": _HOW[mode] + (f" — {note}" if note else "")}
+            for r, mode, note in zip(recs, plan.modes, plan.notes)]
+
+
+def _grouping(plan: tg.FilePlan, album: bool, text: str) -> str:
+    """How the files go out and where the text goes; `text` is "caption", "first" or "" (none)."""
+    n, k = len(plan.modes), len(plan.batches)
+    if n == 1:
+        shape = "1 file"
+    elif k == 1:
+        shape = f"album of {n}"
+    elif album:
+        shape = f"{k} albums ({' + '.join(str(len(b)) for b in plan.batches)})"
+    else:
+        shape = f"{n} separate messages"
+    if text == "first":
+        return f"{shape} · the text first, as its own message (over {CAPTION_MAX} characters for a caption)"
+    if text == "caption":
+        return f"{shape} · the text as {'its caption' if k == 1 else 'the caption of the first'}"
+    return f"{shape}, no text"
+
+
+def _delivered(first, batches: list[list]) -> str:
+    """What went out: "#77", or "#76 (text), #77–#79" when files followed the text."""
+    parts = [tg.sent_ids(b) for b in batches]
+    if first is not None:
+        parts.insert(0, f"#{first.id} (text)" if parts else f"#{first.id}")
+    return ", ".join(parts)
+
+
+def _when(first, batches: list[list]) -> str:
+    for m in [first] + [m for b in batches for m in b]:
+        if getattr(m, "date", None):
+            return tg.ts(m.date)
+    return tg.ts(datetime.now(timezone.utc))
+
+
+async def _deliver(client, entity, body: str, recs: list[uploads.Upload], *, text_first: bool, as_file: bool,
+                   album: bool, reply_to: int | None, plain: bool, silent: bool, no_preview: bool, is_new: bool):
+    """One send_message: the text alone, the files with the text as their caption, or the text
+    first as its own message and the files after it. Returns (text message or None, file batches)."""
+    first = None
+    if body and (text_first or not recs):
+        first = await tg.send_text(client, entity, body, reply_to=reply_to, plain=plain, silent=silent,
+                                   no_preview=no_preview, log=sendlog, is_new=is_new)
+    if not recs:
+        return first, []
+    try:
+        with store.in_use(recs):  # the sweep must not delete them mid-send
+            batches = await tg.send_files(client, entity, [store.path(r) for r in recs],
+                                          caption=body if body and not text_first else None, as_file=as_file,
+                                          album=album, reply_to=reply_to, plain=plain, silent=silent,
+                                          log=sendlog, is_new=is_new)
+    except tg.Fail as e:
+        if first is not None:
+            raise tg.Fail(f"The text went out as #{first.id}; the files did not: {e}") from e
+        raise
+    return first, batches
+
+
 async def _execute_draft(d: Draft) -> str:
-    """Runs only after the owner's ✅. Re-checks lock and budget: both may have changed."""
+    """Runs only after the owner's ✅. Re-checks lock, files and budget: all may have changed."""
     if approvals.locked:
         raise tg.Fail("locked")
+    recs, missing = store.resolve(f["id"] for f in d.files)
+    if missing:
+        gone = ", ".join(f["name"] for f in d.files if f["id"] in missing)
+        raise tg.Fail(f"no longer on the server (expired or deleted): {gone}. Nothing was sent.")
+    n = len(_plan(recs, d.as_file, d.album).batches) + d.text_first if recs else 1
     try:
         client = await account.client()
-        sendlog.check(1, d.peer_id, d.is_new)
-        msg = await tg.send_text(client, d.entity, d.text, reply_to=d.reply_to, plain=d.plain,
-                                 silent=d.silent, no_preview=d.no_preview, log=sendlog, is_new=d.is_new)
+        sendlog.check(n, d.peer_id, d.is_new)
+        first, batches = await _deliver(client, d.entity, d.text, recs, text_first=d.text_first,
+                                        as_file=d.as_file, album=d.album, reply_to=d.reply_to, plain=d.plain,
+                                        silent=d.silent, no_preview=d.no_preview, is_new=d.is_new)
     except tg.UNAUTHORIZED as e:
         await account.mark_dead(type(e).__name__)
         raise tg.Fail("the Telegram session was revoked")
-    _audit("send (approved)", d.peer_label, f"sent #{msg.id}")
-    return f"#{msg.id} at {tg.ts(msg.date)}"
+    sent = _delivered(first, batches)
+    _audit("send (approved)", d.peer_label, f"sent {sent}")
+    return f"{sent} at {_when(first, batches)}"
 
 
 approvals.executor = _execute_draft
@@ -628,10 +709,18 @@ def _describe(d: Draft) -> str:
     return f"⚠️ Draft {d.id} was approved but sending failed: {d.result}"
 
 
-_SEND_ARGS = """
+_SEND_ARGS = f"""
     Args:
         peer: as in read_history.
-        text: the exact message (max 3500 chars). Telethon markdown unless plain=true.
+        text: the exact message (max 3500 chars). Telethon markdown unless plain=true. May be empty
+            when files are given. With files it becomes their caption if its visible text fits
+            {CAPTION_MAX} characters; a longer text goes first, as its own message.
+        files: up to {MAX_FILES_PER_SEND} upload ids (from upload_link + curl, or list_uploads).
+        as_file: true sends every file as a document: original bytes, full resolution. Default
+            false: photos are compressed, videos, audio and GIFs play inline, the rest are documents.
+        album: true (default) groups the files into one message, up to 10 per album: photos with
+            videos, audio with audio, documents with documents, and a GIF always alone. false sends
+            one message per file.
         reply_to: message id to reply to.
         plain: send as literal text (no markdown parsing).
         silent: no notification sound for the recipient.
@@ -640,23 +729,48 @@ _SEND_ARGS = """
             explicitly asked to contact that person.
 """
 SEND_DESC_APPROVAL = (
-    "Ask the owner to send `text` to `peer` from his account. Creates a draft; the owner gets a\n"
-    "card in Telegram with the exact recipient and text and ✅ / ❌. Only his tap sends it.\n"
-    "Waits up to ~75 s for the decision, then returns the draft id — poll send_status, never resubmit.\n"
+    "Ask the owner to send `text` and any uploaded `files` to `peer` from his account. Creates a\n"
+    "draft; the owner gets a card in Telegram with the exact recipient, text and files and ✅ / ❌.\n"
+    "Only his tap sends it. Waits up to ~75 s for the decision, then returns the draft id — poll\n"
+    "send_status, never resubmit.\n"
     + _SEND_ARGS)
 SEND_DESC_DIRECT = (
-    "Send `text` to `peer` from the owner's account, immediately, in his name. On success the\n"
-    "message is already delivered (the result gives its id) and is final; nothing else is needed.\n"
+    "Send `text` and any uploaded `files` to `peer` from the owner's account, immediately, in his\n"
+    "name. On success the message is already delivered (the result gives its id) and is final;\n"
+    "nothing else is needed.\n"
     + _SEND_ARGS)
 
 
-async def send_message(peer: str, text: str, reply_to: int = 0, plain: bool = False,
-                       silent: bool = False, no_preview: bool = False, allow_new: bool = False) -> str:
+async def send_message(peer: str, text: str = "", files: list[str] = [], as_file: bool = False,
+                       album: bool = True, reply_to: int = 0, plain: bool = False, silent: bool = False,
+                       no_preview: bool = False, allow_new: bool = False) -> str:
     body = (text or "").strip("\n")
     if not body.strip():
-        raise ToolError("empty message")
-    if tg.ulen(body) > MAX_DRAFT_CHARS:
-        raise ToolError(f"text is {tg.ulen(body)} chars; the limit is {MAX_DRAFT_CHARS} (one message). "
+        body = ""
+    ids = list(dict.fromkeys(str(f).strip() for f in files or () if str(f).strip()))
+    if not body and not ids:
+        raise ToolError("empty message: give text, files, or both")
+    if len(ids) > MAX_FILES_PER_SEND:
+        raise ToolError(f"{len(ids)} files; at most {MAX_FILES_PER_SEND} go in one call. Split them over "
+                        "several calls.")
+    recs, missing = store.resolve(ids)
+    if missing:
+        raise ToolError(f"Unknown or expired upload ids: {', '.join(missing)}. Nothing was sent. "
+                        "list_uploads() shows the files still here; upload the others again.")
+    rows, grouping, text_first, n_msgs = [], "", False, 1
+    if recs:
+        try:
+            plan = _plan(recs, as_file, album)
+        except tg.Fail as e:
+            raise ToolError(str(e))
+        text_first = bool(body) and tg.caption_len(body, plain) > CAPTION_MAX
+        rows = _file_rows(recs, plan)
+        grouping = _grouping(plan, album, "first" if text_first else "caption" if body else "")
+        n_msgs = len(plan.batches) + text_first
+    limit = MAX_DRAFT_CHARS - (tg.ulen(files_block(rows, grouping)) if SEND_APPROVAL and rows else 0)
+    if tg.ulen(body) > limit:
+        why = "one message" if limit == MAX_DRAFT_CHARS else "the owner's card lists the files too"
+        raise ToolError(f"text is {tg.ulen(body)} chars; the limit is {limit} ({why}). "
                         "Shorten it, or split it into separate messages.")
 
     async def prepare(client):
@@ -666,33 +780,43 @@ async def send_message(peer: str, text: str, reply_to: int = 0, plain: bool = Fa
         if is_new and not allow_new:
             raise tg.Fail(f"No prior conversation with {tg.label(entity)}. A first message to a stranger "
                           "needs allow_new=true, and only when the owner explicitly asked to contact them.")
-        sendlog.check(1, tg.peer_id(entity), is_new)
+        sendlog.check(n_msgs, tg.peer_id(entity), is_new)
         return entity, is_new
 
     if not SEND_APPROVAL:
         async def run_direct(client):
             entity, is_new = await prepare(client)
-            msg = await tg.send_text(client, entity, body, reply_to=reply_to or None, plain=plain,
-                                     silent=silent, no_preview=no_preview, log=sendlog, is_new=is_new)
-            return entity, msg
+            first, batches = await _deliver(client, entity, body, recs, text_first=text_first, as_file=as_file,
+                                            album=album, reply_to=reply_to or None, plain=plain, silent=silent,
+                                            no_preview=no_preview, is_new=is_new)
+            return entity, first, batches
 
-        entity, msg = await _guarded("send_message", peer, run_direct, read=False, audit_ok=False)
-        lbl = tg.label(entity)
-        _audit("send_message", lbl, f"sent #{msg.id}")
+        entity, first, batches = await _guarded("send_message", peer, run_direct, read=False, audit_ok=False)
+        lbl, sent = tg.label(entity), _delivered(first, batches)
+        _audit("send_message", lbl, f"sent {sent}")
         if NOTIFY_SENDS:
-            approvals.notify_bg(f"📤 Sent as you → {lbl} · #{msg.id}\n{RULE}\n{body}", silent=True)
-        return f"✅ Sent #{msg.id} to {lbl} at {tg.ts(msg.date)}."
+            line = f"📤 Sent as you → {lbl} · {sent}"
+            if body:
+                line += f"\n{RULE}\n{body}"
+            if rows:
+                line += f"\n{RULE}\n{files_block(rows, grouping)}"
+            approvals.notify_bg(line, silent=True)
+        return f"✅ Sent {sent} to {lbl} at {_when(first, batches)}" + (f" ({grouping})." if rows else ".")
 
     async def run(client):
         entity, is_new = await prepare(client)
         d = Draft(peer_label=tg.label(entity), peer_id=tg.peer_id(entity), text=body,
                   reply_to=reply_to or None, plain=plain, silent=silent, no_preview=no_preview,
-                  is_new=is_new, entity=entity)
+                  is_new=is_new, entity=entity, files=rows, as_file=as_file, album=album,
+                  text_first=text_first, grouping=grouping)
+        if recs:  # the files outlive the draft, with room left for a slow upload after the tap
+            store.extend(recs, time.time() + APPROVAL_TTL_S + 600)
         await approvals.submit(d)
         return d
 
     d = await _guarded("send_message", peer, run, read=False, audit_ok=False)
-    _audit("send_message", d.peer_label, f"draft {d.id} awaiting approval")
+    _audit("send_message", d.peer_label,
+           f"draft {d.id} awaiting approval" + (f" ({len(rows)} files)" if rows else ""))
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(d.done.wait(), timeout=APPROVAL_WAIT_S)
     return _describe(d)

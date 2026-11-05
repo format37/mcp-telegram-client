@@ -330,3 +330,182 @@ def test_session_errors_are_not_translated(files, log):
     c = FakeClient(fail={0: errors.AuthKeyUnregisteredError(request=None)})
     with pytest.raises(errors.AuthKeyUnregisteredError):
         send(c, files("a.png"), log)
+
+
+# ── send_message: approval mode (the default) ────────────────────────────────
+import re  # noqa: E402
+
+from conftest import OWNER, FakeBotHTTP  # noqa: E402
+from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+
+import main  # noqa: E402
+import uploads  # noqa: E402
+
+
+@pytest.fixture
+def wired(monkeypatch, tmp_path):
+    """main.send_message with Telegram faked: Ivan, a prior chat, a FakeClient taking the sends.
+    A text send shows up in client.calls as ("TEXT", text), so the order is visible."""
+    c = FakeClient()
+    log = tg.SendLog(tmp_path / "sendlog.jsonl")
+    log.min_interval = 0
+    bot = FakeBotHTTP()
+
+    async def get_messages(entity, limit=1):
+        return [object()]
+
+    async def fake_client():
+        return c
+
+    async def fake_resolve(client, spec, policy):
+        return IVAN
+
+    async def fake_text(client, entity, text, **kw):
+        c.calls.append(("TEXT", text))
+        msg = c._msg()
+        kw["log"].record(tg.peer_id(entity), msg.id, kw["is_new"])
+        return msg
+
+    c.get_messages = get_messages
+    monkeypatch.setattr(main.account, "client", fake_client)
+    monkeypatch.setattr(main.tg, "resolve_peer", fake_resolve)
+    monkeypatch.setattr(main.tg, "send_text", fake_text)
+    monkeypatch.setattr(main, "sendlog", log)
+    monkeypatch.setattr(main.approvals, "http", bot)
+    monkeypatch.setattr(main.approvals, "drafts", {})
+    monkeypatch.setattr(main.approvals, "_submits", [])
+    return SimpleNamespace(client=c, bot=bot, log=log)
+
+
+def upload(name, data=None):
+    async def gen():
+        yield data if data is not None else (png(1600, 900) if name.endswith(".png") else b"x" * 100)
+    return asyncio.run(main.store.receive(main.store.new_ticket(), name, gen()))
+
+
+async def tap(d, action="ok"):
+    await main.approvals.handle({"update_id": 1, "callback_query": {
+        "id": "q", "from": {"id": OWNER}, "data": f"{action}:{d.id}", "message": {"message_id": d.card_id}}})
+
+
+async def submit(*args, **kw):
+    """send_message, and the draft it created."""
+    before = set(main.approvals.drafts)
+    out = await main.send_message(*args, **kw)
+    (d,) = [x for k, x in main.approvals.drafts.items() if k not in before]
+    return out, d
+
+
+def test_card_lists_the_files_and_one_tap_sends_them_once(wired):
+    a, b = upload("chart.png"), upload("plot.png")
+
+    async def go():
+        out, d = await submit("@ivan", "Two charts", files=[a.id, b.id])
+        assert "waits for the owner" in out and "Nothing is sent yet" in out
+        assert wired.client.calls == []
+        card = wired.bot.sent("sendMessage")[-1]["text"]
+        assert f"📎 chart.png · {uploads.human(a.size)} · photo (compressed)" in card
+        assert "📎 plot.png" in card and "album of 2 · the text as its caption" in card
+        assert card.index("Two charts") < card.index("📎 chart.png")
+        await tap(d)
+        await tap(d)  # a double tap must not send twice
+        await asyncio.wait_for(d.done.wait(), 5)
+        return d
+
+    d = asyncio.run(go())
+    assert d.status == "sent", d.result
+    ((f, kw),) = wired.client.calls
+    assert names(f) == ["chart.png", "plot.png"] and kw["caption"] == "Two charts"
+    assert wired.log.status()["hour"] == 1 and d.result.startswith("#101–#102 at ")
+
+
+def test_a_file_gone_before_the_tap_fails_the_draft(wired):
+    rec = upload("gone.pdf")
+
+    async def go():
+        _, d = await submit("@ivan", "The report", files=[rec.id])
+        os.remove(main.store.path(rec))
+        await tap(d)
+        await asyncio.wait_for(d.done.wait(), 5)
+        return d
+
+    d = asyncio.run(go())
+    assert d.status == "failed" and "gone.pdf" in d.result and "Nothing was sent" in d.result
+    assert wired.client.calls == [] and wired.log.status()["hour"] == 0
+
+
+def test_files_outlive_the_draft(wired):
+    rec = upload("later.pdf")
+    _, d = asyncio.run(submit("@ivan", "", files=[rec.id]))
+    assert main.store.get(rec.id).expires > d.expires
+
+
+def test_caption_or_text_first_by_parsed_length(wired, monkeypatch):
+    monkeypatch.setattr(main, "CAPTION_MAX", 40)
+    rec = upload("a.pdf")
+    md = "**" + "b" * 30 + "** [x](https://example.com/" + "p" * 40 + ")"  # raw 82, visible 31
+    cases = [(md, False, False), ("c" * 41, False, True), (md, True, True)]
+    for text, plain, first in cases:
+        main.approvals.drafts.clear()
+        _, d = asyncio.run(submit("@ivan", text, files=[rec.id], plain=plain))
+        assert d.text_first is first, (text, plain)
+        card = wired.bot.sent("sendMessage")[-1]["text"]
+        assert ("the text first, as its own message (over 40 characters" in card) is first
+        assert ("1 file · the text as its caption" in card) is not first
+
+
+def test_long_text_goes_first_and_the_files_follow_without_a_caption(wired, monkeypatch):
+    monkeypatch.setattr(main, "CAPTION_MAX", 10)
+    a, b = upload("a.pdf"), upload("b.pdf")
+
+    async def go():
+        _, d = await submit("@ivan", "A text longer than ten", files=[a.id, b.id], reply_to=7)
+        await tap(d)
+        await asyncio.wait_for(d.done.wait(), 5)
+        return d
+
+    d = asyncio.run(go())
+    assert d.status == "sent", d.result
+    (t, text), (f, kw) = wired.client.calls
+    assert (t, text) == ("TEXT", "A text longer than ten")
+    assert names(f) == ["a.pdf", "b.pdf"] and kw["caption"] is None and kw["reply_to"] == 7
+    assert wired.log.status()["hour"] == 2 and d.result.startswith("#101 (text), #102–#103 at ")
+
+
+def test_empty_text_needs_files(wired):
+    rec = upload("only.pdf")
+    out, d = asyncio.run(submit("@ivan", "", files=[rec.id]))
+    assert "1 file, no text" in wired.bot.sent("sendMessage")[-1]["text"] and d.text == ""
+    with pytest.raises(ToolError, match="empty message"):
+        asyncio.run(main.send_message("@ivan", " \n"))
+
+
+def test_unknown_ids_send_nothing(wired):
+    rec = upload("real.pdf")
+    with pytest.raises(ToolError) as e:
+        asyncio.run(main.send_message("@ivan", "hi", files=[rec.id, "f_000000000000"]))
+    assert "f_000000000000" in str(e.value) and rec.id not in str(e.value) and "Nothing was sent" in str(e.value)
+    assert main.approvals.drafts == {} and wired.client.calls == []
+
+
+def test_a_mixed_album_is_refused_before_any_draft(wired):
+    p, d = upload("chart.png"), upload("report.pdf")
+    with pytest.raises(ToolError, match="as_file=true.*album=false"):
+        asyncio.run(main.send_message("@ivan", "hi", files=[p.id, d.id]))
+    assert main.approvals.drafts == {}
+    asyncio.run(submit("@ivan", "hi", files=[p.id, d.id], as_file=True))
+    asyncio.run(submit("@ivan", "hi", files=[p.id, d.id], album=False))
+
+
+def test_the_card_fits_one_bot_message_at_twenty_long_names(wired):
+    recs = [upload("ж" * 95 + f"{i:02d}.pdf") for i in range(20)]
+    ids = [r.id for r in recs]
+    with pytest.raises(ToolError, match="at most 20"):
+        asyncio.run(main.send_message("@ivan", "x", files=ids + [upload("21.pdf").id]))
+    with pytest.raises(ToolError, match="lists the files") as e:
+        asyncio.run(main.send_message("@ivan", "x" * 3500, files=ids))
+    limit = int(re.search(r"the limit is (\d+)", str(e.value)).group(1))
+    _, d = asyncio.run(submit("@ivan", "x" * limit, files=ids, silent=True, reply_to=5))
+    card = wired.bot.sent("sendMessage")[-1]["text"]
+    assert len(card.encode("utf-16-le")) // 2 <= 4096 and card.count("📎") == 20
+    assert "2 albums (10 + 10) · the text first, as its own message" in card  # over 1024: not a caption
